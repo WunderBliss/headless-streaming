@@ -1,0 +1,1054 @@
+#!/usr/bin/env python3
+"""Manage the persistent, synthetic DP-1 display for Sunshine."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import importlib.util
+import json
+import math
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import Iterator
+
+sys.dont_write_bytecode = True
+
+
+CONNECTOR_NAME = "DP-1"
+EXPECTED_VENDOR = "0x1002"
+EXPECTED_DEVICE = "0x1586"
+EXPECTED_DRIVER = "amdgpu"
+EXPECTED_DESKTOP_USER = "owen"
+ROOT_HELPER = Path("/usr/local/libexec/headless-virtual-display-root")
+INSTALLED_EDID_MODULE = Path("/usr/local/lib/headless-virtual-display/edid.py")
+KSCREEN_DOCTOR = Path("/usr/bin/kscreen-doctor")
+SUDO = Path("/usr/bin/sudo")
+POLL_INTERVAL_SECONDS = 0.2
+READY_TIMEOUT_SECONDS = 15.0
+SUBPROCESS_TIMEOUT_SECONDS = 20.0
+SCALE_TOLERANCE = 0.001
+MODE_ID = re.compile(r"[A-Za-z0-9_-]+")
+UNSIGNED_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+UNSIGNED_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class VirtualDisplayError(RuntimeError):
+    """A safe, user-facing virtual-display failure."""
+
+
+def _load_edid_module() -> ModuleType:
+    script_path = Path(__file__).resolve()
+    if script_path.parent == Path("/usr/local/bin"):
+        module_path = INSTALLED_EDID_MODULE
+        try:
+            metadata = module_path.stat()
+        except OSError as error:
+            raise VirtualDisplayError(
+                f"installed EDID module is unavailable at {module_path}: {error}"
+            ) from error
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise VirtualDisplayError(
+                f"installed EDID module must be root-owned and not group/other-writable: {module_path}"
+            )
+    else:
+        module_path = script_path.parent / "edid.py"
+
+    spec = importlib.util.spec_from_file_location(
+        "headless_virtual_display_edid", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise VirtualDisplayError(f"cannot load EDID module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+EDID = _load_edid_module()
+
+
+@dataclass(frozen=True)
+class Topology:
+    card_name: str
+    pci_slot: str
+    pci_device: Path
+    connector: Path
+
+
+@dataclass(frozen=True)
+class KscreenMode:
+    mode_id: str
+    width: int
+    height: int
+    refresh_hz: float
+
+
+@dataclass(frozen=True)
+class KscreenState:
+    connected: bool
+    enabled: bool
+    scale: float
+    current_mode: KscreenMode | None
+    modes: tuple[KscreenMode, ...]
+
+
+def _log(message: str, *, error: bool = False) -> None:
+    print(
+        f"virtual-display: {message}",
+        file=sys.stderr if error else sys.stdout,
+        flush=True,
+    )
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError as error:
+        raise VirtualDisplayError(f"cannot read {path}: {error}") from error
+
+
+def _require_normal_user() -> None:
+    if os.geteuid() == 0:
+        raise VirtualDisplayError(
+            "run this helper as the normal Plasma user, without sudo"
+        )
+    try:
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError as error:
+        raise VirtualDisplayError(
+            f"cannot identify invoking UID {os.geteuid()}"
+        ) from error
+    if user != EXPECTED_DESKTOP_USER:
+        raise VirtualDisplayError(
+            f"run this helper as {EXPECTED_DESKTOP_USER}, not {user}"
+        )
+
+
+def _discover_topology() -> Topology:
+    matches: list[Topology] = []
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+        if "-" in card.name:
+            continue
+        device_link = card / "device"
+        try:
+            vendor = (device_link / "vendor").read_text().strip().lower()
+            device = (device_link / "device").read_text().strip().lower()
+            driver = (device_link / "driver").resolve(strict=True).name
+            pci_device = device_link.resolve(strict=True)
+        except OSError:
+            continue
+        if (vendor, device, driver) != (
+            EXPECTED_VENDOR,
+            EXPECTED_DEVICE,
+            EXPECTED_DRIVER,
+        ):
+            continue
+        if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci_device.name):
+            raise VirtualDisplayError(
+                f"target GPU resolved to unexpected PCI identity {pci_device.name!r}"
+            )
+        connector = Path("/sys/class/drm") / f"{card.name}-{CONNECTOR_NAME}"
+        try:
+            connector_target = connector.resolve(strict=True)
+        except OSError as error:
+            raise VirtualDisplayError(
+                f"target GPU has no {CONNECTOR_NAME} connector: {error}"
+            ) from error
+        if not connector_target.is_relative_to(pci_device):
+            raise VirtualDisplayError(
+                f"{connector} resolves outside target PCI device: {connector_target}"
+            )
+        matches.append(
+            Topology(
+                card_name=card.name,
+                pci_slot=pci_device.name,
+                pci_device=pci_device,
+                connector=connector,
+            )
+        )
+    if not matches:
+        raise VirtualDisplayError(
+            "no unique AMD 1002:1586 amdgpu DRM device with DP-1 was found"
+        )
+    if len(matches) != 1:
+        slots = ", ".join(match.pci_slot for match in matches)
+        raise VirtualDisplayError(
+            f"multiple AMD 1002:1586 amdgpu devices matched ({slots}); refusing ambiguity"
+        )
+    return matches[0]
+
+
+def _connector_status(topology: Topology) -> str:
+    value = _read_text(topology.connector / "status")
+    if value not in {"connected", "disconnected", "unknown"}:
+        raise VirtualDisplayError(
+            f"unexpected {CONNECTOR_NAME} connector status {value!r}"
+        )
+    return value
+
+
+def _connector_edid(topology: Topology) -> bytes:
+    try:
+        return (topology.connector / "edid").read_bytes()
+    except OSError as error:
+        raise VirtualDisplayError(
+            f"cannot read {CONNECTOR_NAME} EDID: {error}"
+        ) from error
+
+
+def _managed_validation(data: bytes):
+    try:
+        return EDID.validate_edid(data, require_poc_identity=True)
+    except EDID.EdidError as error:
+        raise VirtualDisplayError(
+            f"{CONNECTOR_NAME} does not expose the managed VDS/0xd150 EDID: {error}"
+        ) from error
+
+
+def _desktop_environment() -> dict[str, str]:
+    runtime_dir = Path(f"/run/user/{os.geteuid()}")
+    bus = runtime_dir / "bus"
+    try:
+        if not stat.S_ISSOCK(bus.stat().st_mode):
+            raise VirtualDisplayError(f"session bus is not a socket: {bus}")
+    except OSError as error:
+        raise VirtualDisplayError(
+            f"active Plasma session bus is unavailable at {bus}: {error}"
+        ) from error
+
+    environment = os.environ.copy()
+    environment["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    environment["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    environment["XDG_SESSION_TYPE"] = "wayland"
+    supplied_wayland = environment.get("WAYLAND_DISPLAY", "")
+    candidate = runtime_dir / supplied_wayland
+    if (
+        not supplied_wayland
+        or "/" in supplied_wayland
+        or not candidate.exists()
+        or not stat.S_ISSOCK(candidate.stat().st_mode)
+    ):
+        sockets = []
+        for path in runtime_dir.glob("wayland-*"):
+            try:
+                if not path.name.endswith(".lock") and stat.S_ISSOCK(path.stat().st_mode):
+                    sockets.append(path.name)
+            except OSError:
+                continue
+        if not sockets:
+            raise VirtualDisplayError(
+                f"no active Wayland socket was found below {runtime_dir}"
+            )
+        supplied_wayland = sorted(sockets)[0]
+    environment["WAYLAND_DISPLAY"] = supplied_wayland
+    return environment
+
+
+def _run_kscreen(arguments: list[str]) -> str:
+    if not KSCREEN_DOCTOR.is_file() or not os.access(KSCREEN_DOCTOR, os.X_OK):
+        raise VirtualDisplayError("/usr/bin/kscreen-doctor is required")
+    try:
+        result = subprocess.run(
+            [str(KSCREEN_DOCTOR), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_desktop_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VirtualDisplayError(f"kscreen-doctor failed to run: {error}") from error
+    output = ANSI_ESCAPE.sub("", result.stdout + result.stderr).strip()
+    if result.returncode:
+        raise VirtualDisplayError(
+            f"kscreen-doctor {' '.join(arguments)} exited {result.returncode}: "
+            f"{output or '(no output)'}"
+        )
+    return output
+
+
+def _kscreen_state() -> KscreenState | None:
+    raw = _run_kscreen(["-j"])
+    try:
+        configuration = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise VirtualDisplayError(
+            f"kscreen-doctor returned invalid JSON: {error}"
+        ) from error
+    outputs = configuration.get("outputs") if isinstance(configuration, dict) else None
+    if not isinstance(outputs, list):
+        raise VirtualDisplayError("kscreen-doctor JSON has no output list")
+    matches = [
+        output
+        for output in outputs
+        if isinstance(output, dict) and output.get("name") == CONNECTOR_NAME
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise VirtualDisplayError(f"KWin returned multiple {CONNECTOR_NAME} outputs")
+    output = matches[0]
+    raw_modes = output.get("modes")
+    if not isinstance(raw_modes, list):
+        raise VirtualDisplayError(f"KWin {CONNECTOR_NAME} has no mode list")
+    modes: list[KscreenMode] = []
+    for raw_mode in raw_modes:
+        size = raw_mode.get("size") if isinstance(raw_mode, dict) else None
+        try:
+            mode = KscreenMode(
+                mode_id=str(raw_mode["id"]),
+                width=int(size["width"]),
+                height=int(size["height"]),
+                refresh_hz=float(raw_mode["refreshRate"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise VirtualDisplayError(
+                f"KWin {CONNECTOR_NAME} returned a malformed mode"
+            ) from error
+        if (
+            not MODE_ID.fullmatch(mode.mode_id)
+            or mode.width <= 0
+            or mode.height <= 0
+            or not math.isfinite(mode.refresh_hz)
+            or mode.refresh_hz <= 0
+        ):
+            raise VirtualDisplayError(
+                f"KWin {CONNECTOR_NAME} returned an unsafe mode {mode!r}"
+            )
+        modes.append(mode)
+    current_id = str(output.get("currentModeId", ""))
+    current_mode = next(
+        (mode for mode in modes if mode.mode_id == current_id), None
+    )
+    try:
+        scale = float(output["scale"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise VirtualDisplayError(
+            f"KWin {CONNECTOR_NAME} returned an invalid scale"
+        ) from error
+    if not math.isfinite(scale) or not 0.5 <= scale <= 4.0:
+        raise VirtualDisplayError(
+            f"KWin {CONNECTOR_NAME} returned unsafe scale {scale!r}"
+        )
+    return KscreenState(
+        connected=output.get("connected") is True,
+        enabled=output.get("enabled") is True,
+        scale=scale,
+        current_mode=current_mode,
+        modes=tuple(modes),
+    )
+
+
+def _matching_mode(
+    state: KscreenState, width: int, height: int, refresh_hz: float
+) -> KscreenMode | None:
+    candidates = [
+        mode
+        for mode in state.modes
+        if mode.width == width
+        and mode.height == height
+        and abs(mode.refresh_hz - refresh_hz) <= EDID.REFRESH_TOLERANCE_HZ
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda mode: abs(mode.refresh_hz - refresh_hz))
+
+
+def _set_kscreen(mode: KscreenMode, scale: float = 1.0) -> None:
+    if not MODE_ID.fullmatch(mode.mode_id):
+        raise VirtualDisplayError(f"unsafe KScreen mode ID {mode.mode_id!r}")
+    arguments = [
+        f"output.{CONNECTOR_NAME}.enable",
+        f"output.{CONNECTOR_NAME}.mode.{mode.mode_id}",
+        f"output.{CONNECTOR_NAME}.scale.{scale:g}",
+    ]
+    if any(not value.startswith("output.DP-1.") or "HDMI" in value for value in arguments):
+        raise VirtualDisplayError("internal KScreen output allowlist check failed")
+    _run_kscreen(arguments)
+
+
+def _disable_kscreen() -> None:
+    argument = f"output.{CONNECTOR_NAME}.disable"
+    if not argument.startswith("output.DP-1.") or "HDMI" in argument:
+        raise VirtualDisplayError("internal KScreen output allowlist check failed")
+    _run_kscreen([argument])
+
+
+def _secure_executable(path: Path, description: str) -> None:
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise VirtualDisplayError(f"{description} is unavailable at {path}: {error}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise VirtualDisplayError(
+            f"{description} must be root-owned, executable, and not group/other-writable: {path}"
+        )
+
+
+def _root_operation(operation: str, edid: bytes | None = None) -> None:
+    if operation not in {"apply", "retune", "remove"}:
+        raise VirtualDisplayError(f"internal privileged operation rejected: {operation}")
+    _secure_executable(SUDO, "sudo")
+    _secure_executable(ROOT_HELPER, "privileged virtual-display helper")
+    if operation in {"apply", "retune"}:
+        if edid is None:
+            raise VirtualDisplayError(f"{operation} requires an EDID")
+        try:
+            EDID.validate_edid(edid, require_poc_identity=True)
+        except EDID.EdidError as error:
+            raise VirtualDisplayError(
+                f"refusing to send invalid managed EDID to root helper: {error}"
+            ) from error
+    elif edid is not None:
+        raise VirtualDisplayError("remove must not receive an EDID")
+    try:
+        result = subprocess.run(
+            [str(SUDO), "-n", "--", str(ROOT_HELPER), operation],
+            input=edid,
+            capture_output=True,
+            check=False,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VirtualDisplayError(
+            f"privileged {operation} operation could not run: {error}"
+        ) from error
+    output = (result.stdout + result.stderr).decode("utf-8", errors="replace").strip()
+    if result.returncode:
+        raise VirtualDisplayError(
+            f"privileged {operation} operation failed with status {result.returncode}: "
+            f"{output or '(no output)'}"
+        )
+    if output:
+        for line in output.splitlines():
+            _log(f"root-helper: {line}")
+
+
+def _wait_for_exposed(
+    topology: Topology,
+    normalized,
+    *,
+    must_remain_connected: bool,
+) -> tuple[KscreenState, KscreenMode]:
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    last = "no samples"
+    while time.monotonic() < deadline:
+        status = _connector_status(topology)
+        if must_remain_connected and status != "connected":
+            raise VirtualDisplayError(
+                f"{CONNECTOR_NAME} became {status} during in-place retune"
+            )
+        exposed = _connector_edid(topology)
+        try:
+            drm_modes = (topology.connector / "modes").read_text().splitlines()
+        except OSError as error:
+            raise VirtualDisplayError(f"cannot read DRM modes: {error}") from error
+        state = _kscreen_state()
+        mode = (
+            _matching_mode(
+                state,
+                normalized.width,
+                normalized.height,
+                normalized.refresh_hz,
+            )
+            if state is not None
+            else None
+        )
+        last = (
+            f"DRM={status}, EDID={len(exposed)} bytes, "
+            f"mode={'yes' if f'{normalized.width}x{normalized.height}' in drm_modes else 'no'}, "
+            f"KWin={'present' if state is not None else 'absent'}"
+        )
+        if (
+            status == "connected"
+            and exposed == normalized.edid
+            and f"{normalized.width}x{normalized.height}" in drm_modes
+            and state is not None
+            and state.connected
+            and mode is not None
+        ):
+            _managed_validation(exposed)
+            return state, mode
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise VirtualDisplayError(
+        f"timed out waiting for DRM and KWin to expose {normalized.effective}; last state: {last}"
+    )
+
+
+def _wait_for_active(
+    topology: Topology, normalized, expected_scale: float = 1.0
+) -> tuple[KscreenState, KscreenMode]:
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    last = "no samples"
+    while time.monotonic() < deadline:
+        status = _connector_status(topology)
+        exposed = _connector_edid(topology)
+        state = _kscreen_state()
+        if state is not None and state.current_mode is not None:
+            current = state.current_mode
+            last = (
+                f"DRM={status}, enabled={state.enabled}, "
+                f"current={current.width}x{current.height}@{current.refresh_hz:.6f}, "
+                f"scale={state.scale:g}"
+            )
+            if (
+                status == "connected"
+                and exposed == normalized.edid
+                and state.connected
+                and state.enabled
+                and current.width == normalized.width
+                and current.height == normalized.height
+                and abs(current.refresh_hz - normalized.refresh_hz)
+                <= EDID.REFRESH_TOLERANCE_HZ
+                and abs(state.scale - expected_scale) <= SCALE_TOLERANCE
+            ):
+                _managed_validation(exposed)
+                return state, current
+        else:
+            last = f"DRM={status}, KWin output/current mode absent"
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise VirtualDisplayError(
+        f"KWin did not activate {normalized.effective} scale={expected_scale:g}; last state: {last}"
+    )
+
+
+def _wait_removed(topology: Topology) -> None:
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    last = "no samples"
+    while time.monotonic() < deadline:
+        status = _connector_status(topology)
+        state = _kscreen_state()
+        last = f"DRM={status}, KWin={'present' if state else 'absent'}"
+        if status == "disconnected" and state is None:
+            return
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise VirtualDisplayError(
+        f"timed out waiting for administrative removal; last state: {last}"
+    )
+
+
+def _validate_generated(normalized) -> None:
+    try:
+        EDID.validate_edid(
+            normalized.edid,
+            normalized.width,
+            normalized.height,
+            normalized.refresh_hz,
+            require_poc_identity=True,
+        )
+        external = EDID.validate_with_edid_decode(normalized.edid)
+    except EDID.EdidError as error:
+        raise VirtualDisplayError(f"generated EDID validation failed: {error}") from error
+    if external is None:
+        raise VirtualDisplayError(
+            "/usr/bin/edid-decode is required for production EDID validation"
+        )
+
+
+def _log_normalization(normalized) -> None:
+    _log(f"requested {normalized.requested}")
+    if normalized.fallback:
+        _log(f"exact mode unsupported: {normalized.exact_rejection_reason}")
+        _log(f"using fallback {normalized.effective}")
+        if normalized.aspect_error:
+            _log(
+                f"fallback aspect rounding error {normalized.aspect_error * 100:.6f}%"
+            )
+        if normalized.emergency:
+            _log(
+                "WARNING emergency baseline changes the requested aspect ratio",
+                error=True,
+            )
+    else:
+        _log(f"using exact mode {normalized.effective}")
+
+
+def _state_directory() -> Path:
+    runtime = Path(f"/run/user/{os.geteuid()}")
+    try:
+        metadata = runtime.stat()
+    except OSError as error:
+        raise VirtualDisplayError(f"runtime directory unavailable: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise VirtualDisplayError(f"unsafe runtime directory ownership: {runtime}")
+    directory = runtime / "headless-virtual-display"
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory_metadata = directory.stat()
+    except OSError as error:
+        raise VirtualDisplayError(f"cannot prepare runtime state directory: {error}") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & 0o077
+    ):
+        raise VirtualDisplayError(f"unsafe runtime state directory: {directory}")
+    return directory
+
+
+@contextmanager
+def _operation_lock() -> Iterator[Path]:
+    directory = _state_directory()
+    lock_path = directory / "operation.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise VirtualDisplayError(f"unsafe operation lock: {lock_path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield directory
+    finally:
+        os.close(descriptor)
+
+
+def _write_state(directory: Path, payload: dict[str, object]) -> None:
+    state_path = directory / "state.json"
+    payload = {"version": 1, **payload, "updated_unix": int(time.time())}
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".state.", dir=directory, text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, state_path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_state(directory: Path) -> dict[str, object] | None:
+    path = directory / "state.json"
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise VirtualDisplayError(f"unsafe state file: {path}")
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise VirtualDisplayError(f"cannot read transient state: {error}") from error
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise VirtualDisplayError("transient state has an unsupported format")
+    return value
+
+
+def _restore_previous(
+    topology: Topology,
+    previous_edid: bytes,
+    previous_state: KscreenState | None,
+) -> None:
+    previous_validation = _managed_validation(previous_edid)
+    previous = EDID.NormalizedMode(
+        requested_width=previous_validation.timing.width,
+        requested_height=previous_validation.timing.height,
+        requested_hz=previous_validation.timing.actual_hz,
+        width=previous_validation.timing.width,
+        height=previous_validation.timing.height,
+        refresh_hz=previous_validation.timing.actual_hz,
+        edid=previous_edid,
+        fallback=False,
+        exact_rejection_reason=None,
+        aspect_error=0.0,
+        emergency=False,
+    )
+    _root_operation("retune", previous_edid)
+    state, mode = _wait_for_exposed(
+        topology, previous, must_remain_connected=True
+    )
+    if previous_state is not None and previous_state.enabled:
+        rollback_mode = (
+            _matching_mode(
+                state,
+                previous_state.current_mode.width,
+                previous_state.current_mode.height,
+                previous_state.current_mode.refresh_hz,
+            )
+            if previous_state.current_mode is not None
+            else mode
+        )
+        _set_kscreen(rollback_mode or mode, previous_state.scale)
+        _wait_for_active(topology, previous, previous_state.scale)
+    elif previous_state is not None and state.enabled:
+        _disable_kscreen()
+        deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            restored_state = _kscreen_state()
+            if restored_state is not None and not restored_state.enabled:
+                return
+            time.sleep(POLL_INTERVAL_SECONDS)
+        raise VirtualDisplayError(
+            f"KWin did not restore the prior disabled state for {CONNECTOR_NAME}"
+        )
+
+
+def _ensure_mode(
+    normalized,
+    *,
+    require_existing: bool,
+    label: str,
+    state_directory: Path,
+) -> None:
+    _validate_generated(normalized)
+    _log_normalization(normalized)
+    topology = _discover_topology()
+    status = _connector_status(topology)
+    if status == "unknown":
+        raise VirtualDisplayError(f"refusing {label}: {CONNECTOR_NAME} status is unknown")
+    if require_existing and status != "connected":
+        raise VirtualDisplayError(
+            f"refusing {label}: persistent {CONNECTOR_NAME} is not connected before Sunshine prep"
+        )
+
+    previous_edid = b""
+    previous_state: KscreenState | None = None
+    root_operation: str | None = None
+    if status == "connected":
+        previous_edid = _connector_edid(topology)
+        previous_validation = _managed_validation(previous_edid)
+        try:
+            previous_state = _kscreen_state()
+        except VirtualDisplayError:
+            previous_state = None
+        if previous_edid != normalized.edid:
+            if require_existing and (
+                previous_state is None
+                or not previous_state.connected
+                or not previous_state.enabled
+                or previous_state.current_mode is None
+            ):
+                raise VirtualDisplayError(
+                    f"refusing {label}: existing {CONNECTOR_NAME} is not active in KWin before retune"
+                )
+            timing = previous_validation.timing
+            if (
+                require_existing
+                and previous_state is not None
+                and (
+                    previous_state.current_mode.width != timing.width
+                    or previous_state.current_mode.height != timing.height
+                    or abs(previous_state.current_mode.refresh_hz - timing.actual_hz)
+                    > EDID.REFRESH_TOLERANCE_HZ
+                )
+            ):
+                raise VirtualDisplayError(
+                    f"refusing {label}: KWin current mode does not match the existing managed EDID"
+                )
+            root_operation = "retune"
+    else:
+        if _kscreen_state() is not None:
+            raise VirtualDisplayError(
+                f"KWin lists {CONNECTOR_NAME} while DRM reports disconnected"
+            )
+        root_operation = "apply"
+
+    mutated = False
+    try:
+        if root_operation is not None:
+            _root_operation(root_operation, normalized.edid)
+            mutated = True
+        state, mode = _wait_for_exposed(
+            topology,
+            normalized,
+            must_remain_connected=(status == "connected"),
+        )
+        if (
+            not state.enabled
+            or state.current_mode is None
+            or state.current_mode.mode_id != mode.mode_id
+            or abs(state.scale - 1.0) > SCALE_TOLERANCE
+        ):
+            _set_kscreen(mode, 1.0)
+        final_state, final_mode = _wait_for_active(topology, normalized)
+    except Exception as error:
+        if mutated:
+            try:
+                if status == "disconnected":
+                    _root_operation("remove")
+                    _wait_removed(topology)
+                else:
+                    _restore_previous(topology, previous_edid, previous_state)
+            except Exception as rollback_error:
+                raise VirtualDisplayError(
+                    f"{label} failed: {error}; rollback also failed: {rollback_error}. "
+                    f"{CONNECTOR_NAME} needs manual recovery; HDMI-A-1 was never targeted."
+                ) from error
+            raise VirtualDisplayError(
+                f"{label} failed and the previous display state was restored: {error}"
+            ) from error
+        raise
+
+    action = "retuned" if root_operation == "retune" else "created" if root_operation == "apply" else "verified"
+    _log(f"{CONNECTOR_NAME} {action} successfully")
+    _log(
+        f"KWin {CONNECTOR_NAME} active at "
+        f"{final_mode.width}x{final_mode.height}@{final_mode.refresh_hz:.6f} scale={final_state.scale:g}"
+    )
+    _write_state(
+        state_directory,
+        {
+            "connector": CONNECTOR_NAME,
+            "pci_slot": topology.pci_slot,
+            "card": topology.card_name,
+            "present": True,
+            "requested": normalized.requested,
+            "effective": normalized.effective,
+            "fallback": normalized.fallback,
+            "exact_rejection_reason": normalized.exact_rejection_reason,
+            "emergency": normalized.emergency,
+            "kwin_refresh_hz": final_mode.refresh_hz,
+            "scale": final_state.scale,
+            "profile": "baseline"
+            if (
+                normalized.width,
+                normalized.height,
+                normalized.refresh_hz,
+            )
+            == EDID.BASELINE_MODE
+            else "retuned",
+        },
+    )
+
+
+def _parse_width_height(value: str, name: str, maximum: int) -> int:
+    if len(value) > 5 or not UNSIGNED_INTEGER.fullmatch(value):
+        raise VirtualDisplayError(f"{name} must be an unsigned decimal integer")
+    result = int(value)
+    if not 1 <= result <= maximum:
+        raise VirtualDisplayError(f"{name} must be between 1 and {maximum}")
+    return result
+
+
+def _parse_fps(value: str) -> float:
+    if len(value) > 32 or not UNSIGNED_DECIMAL.fullmatch(value):
+        raise VirtualDisplayError(
+            "FPS must be an unsigned decimal number without signs, exponents, or units"
+        )
+    result = float(value)
+    if not math.isfinite(result) or not 1 <= result <= EDID.MAX_REQUEST_HZ:
+        raise VirtualDisplayError(
+            f"FPS must be between 1 and {EDID.MAX_REQUEST_HZ:g}"
+        )
+    return result
+
+
+def _normalized_from_values(width: str, height: str, fps: str):
+    parsed_width = _parse_width_height(width, "WIDTH", EDID.MAX_REQUEST_WIDTH)
+    parsed_height = _parse_width_height(height, "HEIGHT", EDID.MAX_REQUEST_HEIGHT)
+    parsed_fps = _parse_fps(fps)
+    try:
+        return EDID.normalize_mode(parsed_width, parsed_height, parsed_fps)
+    except EDID.EdidError as error:
+        raise VirtualDisplayError(f"mode normalization failed: {error}") from error
+
+
+def command_mode(
+    command: str, width: str, height: str, fps: str, state_directory: Path
+) -> None:
+    normalized = _normalized_from_values(width, height, fps)
+    _ensure_mode(
+        normalized,
+        require_existing=(command == "retune"),
+        label=command,
+        state_directory=state_directory,
+    )
+
+
+def command_sunshine_up(state_directory: Path) -> None:
+    missing = [
+        name
+        for name in (
+            "SUNSHINE_CLIENT_WIDTH",
+            "SUNSHINE_CLIENT_HEIGHT",
+            "SUNSHINE_CLIENT_FPS",
+        )
+        if name not in os.environ
+    ]
+    if missing:
+        raise VirtualDisplayError(
+            "missing Sunshine client environment: " + ", ".join(missing)
+        )
+    normalized = _normalized_from_values(
+        os.environ["SUNSHINE_CLIENT_WIDTH"],
+        os.environ["SUNSHINE_CLIENT_HEIGHT"],
+        os.environ["SUNSHINE_CLIENT_FPS"],
+    )
+    _ensure_mode(
+        normalized,
+        require_existing=True,
+        label="sunshine-up",
+        state_directory=state_directory,
+    )
+
+
+def command_baseline(state_directory: Path) -> None:
+    width, height, refresh_hz = EDID.BASELINE_MODE
+    try:
+        normalized = EDID.normalize_mode(width, height, refresh_hz)
+    except EDID.EdidError as error:
+        raise VirtualDisplayError(f"cannot generate baseline EDID: {error}") from error
+    _ensure_mode(
+        normalized,
+        require_existing=False,
+        label="baseline",
+        state_directory=state_directory,
+    )
+
+
+def command_remove(state_directory: Path) -> None:
+    topology = _discover_topology()
+    status = _connector_status(topology)
+    if status == "unknown":
+        raise VirtualDisplayError("refusing remove while DP-1 status is unknown")
+    if status == "connected":
+        _managed_validation(_connector_edid(topology))
+    _root_operation("remove")
+    _wait_removed(topology)
+    old_state = _read_state(state_directory) or {}
+    _write_state(
+        state_directory,
+        {
+            **{key: value for key, value in old_state.items() if key not in {"updated_unix", "version"}},
+            "present": False,
+            "removed_unix": int(time.time()),
+        },
+    )
+    _log(f"{CONNECTOR_NAME} removed administratively")
+    _log("HDMI-A-1 was not targeted")
+
+
+def command_status(state_directory: Path) -> None:
+    topology = _discover_topology()
+    status = _connector_status(topology)
+    exposed = _connector_edid(topology)
+    modes = (topology.connector / "modes").read_text().splitlines()
+    identity = "absent"
+    generated_mode = "none"
+    profile = "absent"
+    if exposed:
+        try:
+            validation = EDID.validate_edid(exposed, require_poc_identity=True)
+        except EDID.EdidError as error:
+            identity = f"UNRECOGNIZED ({error})"
+            profile = "unmanaged"
+        else:
+            timing = validation.timing
+            identity = "managed VDS product 0xd150 (full synthetic identity valid)"
+            generated_mode = (
+                f"{timing.width}x{timing.height}@{timing.actual_hz:.6f}"
+            )
+            profile = (
+                "baseline"
+                if timing.width == 1920
+                and timing.height == 1080
+                and abs(timing.actual_hz - 60.0) <= EDID.REFRESH_TOLERANCE_HZ
+                else "retuned"
+            )
+    try:
+        kwin = _kscreen_state()
+        kwin_error = None
+    except VirtualDisplayError as error:
+        kwin = None
+        kwin_error = str(error)
+    transient = _read_state(state_directory)
+
+    print(f"target: {CONNECTOR_NAME} ({topology.pci_slot}, {topology.card_name}, amdgpu)")
+    print(f"DRM connector state: {status}")
+    print(f"synthetic EDID identity: {identity}")
+    print(f"active/generated mode: {generated_mode}")
+    print(f"DRM modes: {', '.join(modes) or '(none)'}")
+    print(f"display profile: {profile}")
+    if kwin is not None:
+        current = (
+            f"{kwin.current_mode.width}x{kwin.current_mode.height}@{kwin.current_mode.refresh_hz:.6f}"
+            if kwin.current_mode is not None
+            else "none"
+        )
+        print(
+            f"KWin {CONNECTOR_NAME}: connected={kwin.connected} enabled={kwin.enabled} "
+            f"mode={current} scale={kwin.scale:g}"
+        )
+    elif kwin_error:
+        print(f"KWin {CONNECTOR_NAME}: unavailable ({kwin_error})")
+    else:
+        print(f"KWin {CONNECTOR_NAME}: absent")
+    if transient is None:
+        print("last request: unavailable (no transient state)")
+    else:
+        print(f"last request: {transient.get('requested', 'unknown')}")
+        print(f"last effective mode: {transient.get('effective', 'unknown')}")
+        print(f"last fallback: {transient.get('fallback', 'unknown')}")
+        if transient.get("exact_rejection_reason"):
+            print(
+                "last exact rejection: "
+                f"{transient['exact_rejection_reason']}"
+            )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for command in ("up", "retune"):
+        mode = commands.add_parser(command)
+        mode.add_argument("width")
+        mode.add_argument("height")
+        mode.add_argument("fps")
+    commands.add_parser("sunshine-up")
+    commands.add_parser("baseline")
+    commands.add_parser("status")
+    commands.add_parser("remove")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        _require_normal_user()
+        args = _parser().parse_args(argv)
+        with _operation_lock() as state_directory:
+            if args.command in {"up", "retune"}:
+                command_mode(
+                    args.command, args.width, args.height, args.fps, state_directory
+                )
+            elif args.command == "sunshine-up":
+                command_sunshine_up(state_directory)
+            elif args.command == "baseline":
+                command_baseline(state_directory)
+            elif args.command == "remove":
+                command_remove(state_directory)
+            else:
+                command_status(state_directory)
+        return 0
+    except (EDID.EdidError, VirtualDisplayError, OSError) as error:
+        _log(f"ERROR {error}", error=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

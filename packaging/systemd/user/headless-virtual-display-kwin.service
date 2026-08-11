@@ -1,0 +1,14 @@
+[Unit]
+Description=Normalize persistent DP-1 in the Plasma session
+After=plasma-kwin_wayland.service
+Before=app-dev.lizardbyte.app.Sunshine.service
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/virtual-display baseline
+RemainAfterExit=yes
+TimeoutStartSec=45
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""Create, retune, remove, or inspect the hard-coded DP-1 virtual-display POC."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from edid import (  # noqa: E402
+    EdidError,
+    REFRESH_TOLERANCE_HZ,
+    generate_edid,
+    is_poc_edid,
+    validate_edid,
+    validate_with_edid_decode,
+)
+
+
+CARD_NAME = "card1"
+CONNECTOR_NAME = "DP-1"
+SYSFS_CONNECTOR_NAME = f"{CARD_NAME}-{CONNECTOR_NAME}"
+PCI_SLOT = "0000:c5:00.0"
+EXPECTED_VENDOR = "0x1002"
+EXPECTED_DEVICE = "0x1586"
+EXPECTED_DESKTOP_USER = "owen"
+
+SYSFS_CARD = Path("/sys/class/drm") / CARD_NAME
+SYSFS_CONNECTOR = Path("/sys/class/drm") / SYSFS_CONNECTOR_NAME
+DEBUGFS_CONNECTOR = Path("/sys/kernel/debug/dri") / PCI_SLOT / CONNECTOR_NAME
+EDID_OVERRIDE = DEBUGFS_CONNECTOR / "edid_override"
+FORCE = DEBUGFS_CONNECTOR / "force"
+TRIGGER_HOTPLUG = DEBUGFS_CONNECTOR / "trigger_hotplug"
+ALLOWED_WRITE_PATHS = frozenset((EDID_OVERRIDE, FORCE, TRIGGER_HOTPLUG))
+
+POLL_INTERVAL_SECONDS = 0.25
+SYSFS_TIMEOUT_SECONDS = 8.0
+KWIN_TIMEOUT_SECONDS = 12.0
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+KSCREEN_DOCTOR = Path("/usr/bin/kscreen-doctor")
+SUDO = Path("/usr/bin/sudo")
+TEE = Path("/usr/bin/tee")
+TEST = Path("/usr/bin/test")
+
+
+class PocError(RuntimeError):
+    """A clear, expected POC safety or runtime failure."""
+
+
+@dataclass(frozen=True)
+class KscreenMode:
+    """One KScreen mode belonging to the hard-coded DP-1 output."""
+
+    mode_id: str
+    width: int
+    height: int
+    refresh_hz: float
+
+
+@dataclass(frozen=True)
+class KscreenOutputState:
+    """KScreen state needed to apply or roll back an in-place retune."""
+
+    enabled: bool
+    connected: bool
+    scale: float
+    current_mode: KscreenMode | None
+    modes: tuple[KscreenMode, ...]
+
+
+@dataclass
+class RetuneObservations:
+    """Poll observations useful for spotting compositor transients."""
+
+    samples: int = 0
+    kwin_missing_samples: int = 0
+    stale_edid_samples: int = 0
+    stale_drm_mode_samples: int = 0
+    stale_kwin_mode_samples: int = 0
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError as error:
+        raise PocError(f"cannot read {path}: {error}") from error
+
+
+def _validate_topology() -> None:
+    if CARD_NAME != "card1" or CONNECTOR_NAME != "DP-1":
+        raise PocError("internal safety check rejected an unexpected card/connector name")
+    if SYSFS_CONNECTOR.name != "card1-DP-1":
+        raise PocError(f"unexpected sysfs connector name: {SYSFS_CONNECTOR.name}")
+    if DEBUGFS_CONNECTOR != Path("/sys/kernel/debug/dri/0000:c5:00.0/DP-1"):
+        raise PocError(f"unexpected debugfs connector path: {DEBUGFS_CONNECTOR}")
+    if ALLOWED_WRITE_PATHS != frozenset(
+        (
+            Path("/sys/kernel/debug/dri/0000:c5:00.0/DP-1/edid_override"),
+            Path("/sys/kernel/debug/dri/0000:c5:00.0/DP-1/force"),
+            Path("/sys/kernel/debug/dri/0000:c5:00.0/DP-1/trigger_hotplug"),
+        )
+    ):
+        raise PocError("internal safety check rejected the debugfs endpoint allowlist")
+
+    try:
+        connector_target = SYSFS_CONNECTOR.resolve(strict=True)
+        card_target = SYSFS_CARD.resolve(strict=True)
+    except OSError as error:
+        raise PocError(f"expected Strix Halo DRM topology is missing: {error}") from error
+    expected_connector_suffix = f"/{PCI_SLOT}/drm/{CARD_NAME}/{SYSFS_CONNECTOR_NAME}"
+    if not str(connector_target).endswith(expected_connector_suffix):
+        raise PocError(
+            f"{SYSFS_CONNECTOR} resolves to unexpected target {connector_target}"
+        )
+    if not str(card_target).endswith(f"/{PCI_SLOT}/drm/{CARD_NAME}"):
+        raise PocError(f"{SYSFS_CARD} resolves to unexpected target {card_target}")
+
+    vendor = _read_text(SYSFS_CARD / "device/vendor")
+    device = _read_text(SYSFS_CARD / "device/device")
+    try:
+        driver = (SYSFS_CARD / "device/driver").resolve(strict=True).name
+    except OSError as error:
+        raise PocError(f"cannot resolve the kernel driver for {CARD_NAME}: {error}") from error
+    if (vendor, device, driver) != (EXPECTED_VENDOR, EXPECTED_DEVICE, "amdgpu"):
+        raise PocError(
+            "unexpected card identity: "
+            f"vendor={vendor}, device={device}, driver={driver}; "
+            f"expected {EXPECTED_VENDOR}:{EXPECTED_DEVICE} on amdgpu"
+        )
+
+
+def _connector_status() -> str:
+    status = _read_text(SYSFS_CONNECTOR / "status")
+    if status not in ("connected", "disconnected", "unknown"):
+        raise PocError(f"unexpected {SYSFS_CONNECTOR_NAME} status: {status!r}")
+    return status
+
+
+def _ensure_kscreen_doctor() -> None:
+    if not KSCREEN_DOCTOR.is_file() or not os.access(KSCREEN_DOCTOR, os.X_OK):
+        raise PocError("kscreen-doctor is required for KWin verification but is not installed")
+
+
+def _require_normal_user() -> None:
+    if os.geteuid() == 0:
+        raise PocError(
+            "run this helper as the normal Plasma user, without sudo; it invokes sudo "
+            "only for the fixed debugfs endpoint checks and writes"
+        )
+    try:
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError as error:
+        raise PocError(f"cannot identify desktop user UID {os.geteuid()}") from error
+    if user != EXPECTED_DESKTOP_USER:
+        raise PocError(
+            f"run this helper as desktop user {EXPECTED_DESKTOP_USER}, not {user}"
+        )
+
+
+def _desktop_process_context() -> dict[str, str]:
+    _require_normal_user()
+    env = os.environ.copy()
+    uid = os.geteuid()
+
+    runtime_dir = Path(f"/run/user/{uid}")
+    bus = runtime_dir / "bus"
+    try:
+        if not stat.S_ISSOCK(bus.stat().st_mode):
+            raise PocError(f"active user session bus is not a socket: {bus}")
+    except FileNotFoundError as error:
+        raise PocError(f"active user session bus is missing: {bus}") from error
+    except OSError as error:
+        raise PocError(f"cannot inspect active user session bus {bus}: {error}") from error
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    env["XDG_SESSION_TYPE"] = "wayland"
+
+    wayland_display = env.get("WAYLAND_DISPLAY")
+    if wayland_display:
+        candidate = runtime_dir / wayland_display
+        try:
+            if "/" in wayland_display or not stat.S_ISSOCK(candidate.stat().st_mode):
+                wayland_display = None
+        except OSError:
+            wayland_display = None
+    if not wayland_display:
+        sockets: list[str] = []
+        try:
+            for candidate in runtime_dir.glob("wayland-*"):
+                if candidate.name.endswith(".lock"):
+                    continue
+                if stat.S_ISSOCK(candidate.stat().st_mode):
+                    sockets.append(candidate.name)
+        except OSError as error:
+            raise PocError(f"cannot inspect Wayland sockets in {runtime_dir}: {error}") from error
+        if not sockets:
+            raise PocError(f"no Wayland display socket found in {runtime_dir}")
+        wayland_display = sorted(sockets)[0]
+    env["WAYLAND_DISPLAY"] = wayland_display
+    return env
+
+
+def _run_kscreen_doctor(arguments: list[str]) -> str:
+    _ensure_kscreen_doctor()
+    env = _desktop_process_context()
+    try:
+        result = subprocess.run(
+            [str(KSCREEN_DOCTOR), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PocError(f"kscreen-doctor failed to run: {error}") from error
+    output = ANSI_ESCAPE.sub("", result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise PocError(
+            "kscreen-doctor "
+            f"{' '.join(arguments)} exited with status {result.returncode}: "
+            f"{output or '(no output)'}"
+        )
+    return output
+
+
+def _kscreen_output() -> str:
+    return _run_kscreen_doctor(["-o"])
+
+
+def _kscreen_configuration() -> dict[str, object]:
+    output = _run_kscreen_doctor(["-j"])
+    try:
+        configuration = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise PocError(f"kscreen-doctor -j returned invalid JSON: {error}") from error
+    if not isinstance(configuration, dict):
+        raise PocError("kscreen-doctor -j did not return a JSON object")
+    return configuration
+
+
+def _kscreen_connector_state(
+    configuration: dict[str, object] | None = None,
+) -> KscreenOutputState | None:
+    if configuration is None:
+        configuration = _kscreen_configuration()
+    outputs = configuration.get("outputs")
+    if not isinstance(outputs, list):
+        raise PocError("kscreen-doctor JSON has no output list")
+
+    matches = [
+        output
+        for output in outputs
+        if isinstance(output, dict) and output.get("name") == CONNECTOR_NAME
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PocError(f"KWin returned more than one {CONNECTOR_NAME} output")
+    output = matches[0]
+
+    raw_modes = output.get("modes")
+    if not isinstance(raw_modes, list):
+        raise PocError(f"KWin output {CONNECTOR_NAME} has no mode list")
+    modes: list[KscreenMode] = []
+    for raw_mode in raw_modes:
+        if not isinstance(raw_mode, dict) or not isinstance(raw_mode.get("size"), dict):
+            raise PocError(f"KWin output {CONNECTOR_NAME} has a malformed mode")
+        size = raw_mode["size"]
+        try:
+            mode = KscreenMode(
+                mode_id=str(raw_mode["id"]),
+                width=int(size["width"]),
+                height=int(size["height"]),
+                refresh_hz=float(raw_mode["refreshRate"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise PocError(
+                f"KWin output {CONNECTOR_NAME} has a malformed mode: {error}"
+            ) from error
+        if (
+            not mode.mode_id
+            or mode.width <= 0
+            or mode.height <= 0
+            or not math.isfinite(mode.refresh_hz)
+            or mode.refresh_hz <= 0
+        ):
+            raise PocError(f"KWin output {CONNECTOR_NAME} has an invalid mode: {mode}")
+        modes.append(mode)
+
+    current_mode_id = str(output.get("currentModeId", ""))
+    current_mode = next(
+        (mode for mode in modes if mode.mode_id == current_mode_id), None
+    )
+    try:
+        scale = float(output["scale"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PocError(f"KWin output {CONNECTOR_NAME} has an invalid scale") from error
+    if not math.isfinite(scale) or not 0.5 <= scale <= 4.0:
+        raise PocError(f"KWin output {CONNECTOR_NAME} has unsafe scale {scale!r}")
+
+    return KscreenOutputState(
+        enabled=output.get("enabled") is True,
+        connected=output.get("connected") is True,
+        scale=scale,
+        current_mode=current_mode,
+        modes=tuple(modes),
+    )
+
+
+def _matching_kscreen_mode(
+    state: KscreenOutputState, width: int, height: int, fps: float
+) -> KscreenMode | None:
+    matches = [
+        mode
+        for mode in state.modes
+        if mode.width == width
+        and mode.height == height
+        and abs(mode.refresh_hz - fps) <= REFRESH_TOLERANCE_HZ
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda mode: abs(mode.refresh_hz - fps))
+
+
+def _set_kscreen_mode_and_scale(mode_id: str, scale: float) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", mode_id):
+        raise PocError(f"refusing unsafe KScreen mode ID {mode_id!r}")
+    if not math.isfinite(scale) or not 0.5 <= scale <= 4.0:
+        raise PocError(f"refusing unsafe KScreen scale {scale!r}")
+    arguments = [
+        f"output.{CONNECTOR_NAME}.mode.{mode_id}",
+        f"output.{CONNECTOR_NAME}.scale.{scale:g}",
+    ]
+    if any(
+        "HDMI" in argument or not argument.startswith("output.DP-1.")
+        for argument in arguments
+    ):
+        raise PocError("internal safety check rejected unexpected KScreen output arguments")
+    _run_kscreen_doctor(arguments)
+
+
+def _kwin_connector_block(output: str) -> str | None:
+    blocks = re.split(r"(?=^Output: )", output, flags=re.MULTILINE)
+    for block in blocks:
+        first_line = block.splitlines()[0] if block.splitlines() else ""
+        if re.search(rf"^Output:\s+\d+\s+{re.escape(CONNECTOR_NAME)}(?:\s|$)", first_line):
+            return block.strip()
+    return None
+
+
+def _kwin_has_requested_mode(output: str, width: int, height: int, fps: float) -> bool:
+    block = _kwin_connector_block(output)
+    if block is None:
+        return False
+    refreshes = [
+        float(match)
+        for match in re.findall(rf"\b{width}x{height}@([0-9]+(?:\.[0-9]+)?)", block)
+    ]
+    return any(abs(refresh - fps) <= REFRESH_TOLERANCE_HZ for refresh in refreshes)
+
+
+def _ensure_privilege_tools() -> None:
+    errors: list[str] = []
+    for path in (SUDO, TEE, TEST):
+        try:
+            metadata = path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                errors.append(f"{path} is not a regular file")
+            elif metadata.st_uid != 0:
+                errors.append(f"{path} is not owned by root")
+            elif metadata.st_mode & 0o022:
+                errors.append(f"{path} is writable by group or other")
+            elif not os.access(path, os.X_OK):
+                errors.append(f"{path} is not executable")
+        except OSError as error:
+            errors.append(f"{path}: {error}")
+    if errors:
+        raise PocError("privilege-tool preflight failed:\n  " + "\n  ".join(errors))
+
+
+def _sudo_command(arguments: list[str], *, input_data: bytes | None = None) -> None:
+    _require_normal_user()
+    _ensure_privilege_tools()
+    allowed_target = (
+        len(arguments) == 3 and Path(arguments[2]) in ALLOWED_WRITE_PATHS
+    )
+    is_endpoint_test = (
+        allowed_target
+        and arguments[0] == str(TEST)
+        and arguments[1] in ("-f", "-w")
+        and input_data is None
+    )
+    is_endpoint_write = (
+        allowed_target
+        and arguments[0] == str(TEE)
+        and arguments[1] == "--"
+        and input_data is not None
+    )
+    if not (is_endpoint_test or is_endpoint_write):
+        raise PocError(
+            "refusing privileged subprocess outside the fixed debugfs test/write forms"
+        )
+    command = [str(SUDO), "--", *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            input=input_data,
+            stdout=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise PocError(f"failed to invoke narrow sudo command: {error}") from error
+    if result.returncode != 0:
+        raise PocError(
+            f"narrow sudo command failed with status {result.returncode}: "
+            f"{' '.join(arguments)}"
+        )
+
+
+def _sudo_debugfs_preflight() -> None:
+    # Traversing debugfs is root-only on this host, so fixed-path tests use sudo too.
+    for path in sorted(ALLOWED_WRITE_PATHS, key=str):
+        try:
+            _sudo_command([str(TEST), "-f", str(path)])
+            _sudo_command([str(TEST), "-w", str(path)])
+        except PocError as error:
+            raise PocError(f"debugfs endpoint preflight failed for {path}: {error}") from error
+
+
+def _sudo_write_exact(path: Path, data: bytes) -> None:
+    if path not in ALLOWED_WRITE_PATHS:
+        raise PocError(f"refusing write outside the debugfs endpoint allowlist: {path}")
+    if path == EDID_OVERRIDE:
+        if data != b"reset":
+            try:
+                validate_edid(data, require_poc_identity=True)
+            except EdidError as error:
+                raise PocError(f"refusing invalid POC EDID payload: {error}") from error
+    elif path == FORCE:
+        if data not in (b"on", b"unspecified"):
+            raise PocError(f"refusing unexpected force payload: {data!r}")
+    elif path == TRIGGER_HOTPLUG:
+        if data != b"1\n":
+            raise PocError(f"refusing unexpected hotplug payload: {data!r}")
+    # tee receives exactly one payload on stdin. It adds no newline of its own.
+    _sudo_command([str(TEE), "--", str(path)], input_data=data)
+
+
+def _trigger_hotplug() -> None:
+    _sudo_write_exact(TRIGGER_HOTPLUG, b"1\n")
+
+
+def _teardown_writes() -> None:
+    # Exact printf-equivalent payloads: do not add newlines to these two controls.
+    errors: list[str] = []
+    for path, payload in ((FORCE, b"unspecified"), (EDID_OVERRIDE, b"reset")):
+        try:
+            _sudo_write_exact(path, payload)
+        except PocError as error:
+            errors.append(str(error))
+    try:
+        _trigger_hotplug()
+    except PocError as error:
+        errors.append(str(error))
+    if errors:
+        raise PocError("teardown writes were incomplete:\n  " + "\n  ".join(errors))
+
+
+def _wait_for_status(expected: str) -> None:
+    deadline = time.monotonic() + SYSFS_TIMEOUT_SECONDS
+    last = "unread"
+    while time.monotonic() < deadline:
+        last = _connector_status()
+        if last == expected:
+            return
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise PocError(
+        f"timed out after {SYSFS_TIMEOUT_SECONDS:g}s waiting for "
+        f"{SYSFS_CONNECTOR_NAME} to become {expected}; last status was {last}"
+    )
+
+
+def _wait_for_kwin_mode(width: int, height: int, fps: float) -> str:
+    deadline = time.monotonic() + KWIN_TIMEOUT_SECONDS
+    last_output = ""
+    while time.monotonic() < deadline:
+        last_output = _kscreen_output()
+        if _kwin_has_requested_mode(last_output, width, height, fps):
+            return last_output
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise PocError(
+        f"KWin did not expose {CONNECTOR_NAME} mode {width}x{height}@{fps:g} "
+        f"within {KWIN_TIMEOUT_SECONDS:g}s. Last kscreen-doctor output:\n{last_output}"
+    )
+
+
+def _wait_for_kwin_absent() -> str:
+    deadline = time.monotonic() + KWIN_TIMEOUT_SECONDS
+    last_output = ""
+    while time.monotonic() < deadline:
+        last_output = _kscreen_output()
+        if _kwin_connector_block(last_output) is None:
+            return last_output
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise PocError(
+        f"KWin still lists {CONNECTOR_NAME} after {KWIN_TIMEOUT_SECONDS:g}s. "
+        f"Last kscreen-doctor output:\n{last_output}"
+    )
+
+
+def _retune_writes(edid: bytes) -> None:
+    """Replace the override in place, preserve force-on, and request redetection."""
+    _sudo_write_exact(EDID_OVERRIDE, edid)
+    _sudo_write_exact(FORCE, b"on")
+    _trigger_hotplug()
+
+
+def _wait_for_retune_exposed(
+    edid: bytes, width: int, height: int, fps: float
+) -> tuple[KscreenOutputState, KscreenMode, RetuneObservations]:
+    deadline = time.monotonic() + max(SYSFS_TIMEOUT_SECONDS, KWIN_TIMEOUT_SECONDS)
+    observations = RetuneObservations()
+    last_details = "no samples"
+    requested_mode = f"{width}x{height}"
+
+    while time.monotonic() < deadline:
+        observations.samples += 1
+        status = _connector_status()
+        if status != "connected":
+            raise PocError(
+                f"{SYSFS_CONNECTOR_NAME} became {status!r} during in-place retune"
+            )
+
+        exposed_edid = (SYSFS_CONNECTOR / "edid").read_bytes()
+        drm_modes = (SYSFS_CONNECTOR / "modes").read_text().splitlines()
+        state = _kscreen_connector_state()
+        if exposed_edid != edid:
+            observations.stale_edid_samples += 1
+        if requested_mode not in drm_modes:
+            observations.stale_drm_mode_samples += 1
+        if state is None or not state.connected or not state.enabled:
+            observations.kwin_missing_samples += 1
+            mode = None
+        else:
+            mode = _matching_kscreen_mode(state, width, height, fps)
+            if mode is None:
+                observations.stale_kwin_mode_samples += 1
+
+        kwin_state = (
+            "missing/disabled"
+            if state is None or not state.connected or not state.enabled
+            else "present"
+        )
+        last_details = (
+            f"EDID bytes={len(exposed_edid)}, DRM modes="
+            f"{', '.join(drm_modes) or '(none)'}, "
+            f"KWin={kwin_state}"
+        )
+        if (
+            exposed_edid == edid
+            and requested_mode in drm_modes
+            and state is not None
+            and state.connected
+            and state.enabled
+            and mode is not None
+        ):
+            validate_edid(
+                exposed_edid,
+                width,
+                height,
+                fps,
+                require_poc_identity=True,
+            )
+            return state, mode, observations
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise PocError(
+        f"timed out after {max(SYSFS_TIMEOUT_SECONDS, KWIN_TIMEOUT_SECONDS):g}s "
+        f"waiting for retuned {CONNECTOR_NAME}; last state: {last_details}"
+    )
+
+
+def _wait_for_current_mode_and_scale(
+    edid: bytes, width: int, height: int, fps: float, scale: float
+) -> KscreenOutputState:
+    deadline = time.monotonic() + KWIN_TIMEOUT_SECONDS
+    last_details = "no samples"
+    while time.monotonic() < deadline:
+        status = _connector_status()
+        if status != "connected":
+            raise PocError(
+                f"{SYSFS_CONNECTOR_NAME} became {status!r} while applying KScreen state"
+            )
+        if (SYSFS_CONNECTOR / "edid").read_bytes() != edid:
+            raise PocError("DRM EDID changed unexpectedly while applying KScreen state")
+
+        state = _kscreen_connector_state()
+        if state is not None and state.current_mode is not None:
+            mode = state.current_mode
+            last_details = (
+                f"current={mode.width}x{mode.height}@{mode.refresh_hz:.6f}, "
+                f"scale={state.scale:g}, enabled={state.enabled}, connected={state.connected}"
+            )
+            if (
+                state.enabled
+                and state.connected
+                and mode.width == width
+                and mode.height == height
+                and abs(mode.refresh_hz - fps) <= REFRESH_TOLERANCE_HZ
+                and abs(state.scale - scale) <= 0.001
+            ):
+                return state
+        else:
+            last_details = "KWin output or current mode missing"
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise PocError(
+        f"KWin did not apply {width}x{height}@{fps:g} scale {scale:g} within "
+        f"{KWIN_TIMEOUT_SECONDS:g}s; last state: {last_details}"
+    )
+
+
+def _restore_retune_state(
+    previous_edid: bytes, previous_mode: KscreenMode, previous_scale: float
+) -> None:
+    """Best-effort rollback that never forces DP-1 off or resets its EDID."""
+    _retune_writes(previous_edid)
+    state, mode, _ = _wait_for_retune_exposed(
+        previous_edid,
+        previous_mode.width,
+        previous_mode.height,
+        previous_mode.refresh_hz,
+    )
+    rollback_mode = _matching_kscreen_mode(
+        state,
+        previous_mode.width,
+        previous_mode.height,
+        previous_mode.refresh_hz,
+    )
+    if rollback_mode is None:
+        rollback_mode = mode
+    _set_kscreen_mode_and_scale(rollback_mode.mode_id, previous_scale)
+    _wait_for_current_mode_and_scale(
+        previous_edid,
+        previous_mode.width,
+        previous_mode.height,
+        previous_mode.refresh_hz,
+        previous_scale,
+    )
+
+
+def _print_validation(data: bytes, width: int, height: int, fps: float) -> None:
+    result = validate_edid(
+        data, width, height, fps, require_poc_identity=True
+    )
+    print("\n".join(result.lines()))
+    external_output = validate_with_edid_decode(data)
+    if external_output is None:
+        print("  edid-decode: not installed (internal validation only)")
+    else:
+        print("  edid-decode --check: PASS (EDID conformity: PASS)")
+
+
+def command_up(width: int, height: int, fps: float) -> int:
+    _require_normal_user()
+    _validate_topology()
+    if _connector_status() != "disconnected":
+        raise PocError(
+            f"refusing up: {SYSFS_CONNECTOR_NAME} is not disconnected; "
+            "a physical or existing synthetic display may be attached"
+        )
+
+    edid = generate_edid(width, height, fps)
+    _print_validation(edid, width, height, fps)
+    baseline = _kscreen_output()
+    if _kwin_connector_block(baseline) is not None:
+        raise PocError(
+            f"refusing up: KWin already lists {CONNECTOR_NAME} while sysfs says disconnected"
+        )
+
+    # The parent remains the desktop user. Only fixed test/tee child commands use sudo.
+    _sudo_debugfs_preflight()
+    mutated = False
+    try:
+        mutated = True
+        _sudo_write_exact(EDID_OVERRIDE, edid)
+        _sudo_write_exact(FORCE, b"on")  # Exact printf-equivalent payload; no newline.
+        _trigger_hotplug()
+        _wait_for_status("connected")
+
+        exposed_edid = (SYSFS_CONNECTOR / "edid").read_bytes()
+        if not exposed_edid:
+            raise PocError(f"{SYSFS_CONNECTOR}/edid is empty after hotplug")
+        validate_edid(
+            exposed_edid, width, height, fps, require_poc_identity=True
+        )
+        if exposed_edid != edid:
+            raise PocError("DRM exposed EDID differs from the generated EDID")
+
+        drm_modes = (SYSFS_CONNECTOR / "modes").read_text().splitlines()
+        requested_mode = f"{width}x{height}"
+        if requested_mode not in drm_modes:
+            raise PocError(
+                f"DRM mode list does not include {requested_mode}: "
+                f"{', '.join(drm_modes) or '(empty)'}"
+            )
+        kscreen = _wait_for_kwin_mode(width, height, fps)
+    except Exception as error:
+        if mutated:
+            try:
+                _teardown_writes()
+                _wait_for_status("disconnected")
+            except Exception as rollback_error:
+                raise PocError(
+                    f"up failed: {error}; automatic rollback also failed: {rollback_error}. "
+                    "Run the documented down command immediately."
+                ) from error
+            raise PocError(f"up failed and was rolled back: {error}") from error
+        raise
+
+    print(f"{SYSFS_CONNECTOR_NAME} is connected with a non-empty, validated EDID.")
+    print(f"DRM modes: {', '.join(drm_modes)}")
+    print("kscreen-doctor -o:")
+    print(kscreen)
+    print("HDMI-A-1 was not written or reconfigured.")
+    return 0
+
+
+def command_retune(width: int, height: int, fps: float) -> int:
+    _require_normal_user()
+    _validate_topology()
+    if _connector_status() != "connected":
+        raise PocError(
+            f"refusing retune: {SYSFS_CONNECTOR_NAME} is not already connected"
+        )
+
+    try:
+        previous_edid = (SYSFS_CONNECTOR / "edid").read_bytes()
+    except OSError as error:
+        raise PocError(f"cannot read current {CONNECTOR_NAME} EDID: {error}") from error
+    if not previous_edid:
+        raise PocError(f"refusing retune: connected {CONNECTOR_NAME} has an empty EDID")
+    try:
+        previous_validation = validate_edid(
+            previous_edid, require_poc_identity=True
+        )
+    except EdidError as error:
+        raise PocError(
+            f"refusing retune: connected {CONNECTOR_NAME} does not expose a valid "
+            f"VDS/0xd150 synthetic EDID: {error}"
+        ) from error
+
+    previous_state = _kscreen_connector_state()
+    if (
+        previous_state is None
+        or not previous_state.connected
+        or not previous_state.enabled
+        or previous_state.current_mode is None
+    ):
+        raise PocError(
+            f"refusing retune: KWin does not show active, enabled {CONNECTOR_NAME}"
+        )
+    previous_mode = previous_state.current_mode
+    previous_timing = previous_validation.timing
+    if (
+        previous_mode.width != previous_timing.width
+        or previous_mode.height != previous_timing.height
+        or abs(previous_mode.refresh_hz - previous_timing.actual_hz)
+        > REFRESH_TOLERANCE_HZ
+    ):
+        raise PocError(
+            "refusing retune: KWin's current DP-1 mode does not match the "
+            "current synthetic EDID preferred timing"
+        )
+
+    edid = generate_edid(width, height, fps)
+    _print_validation(edid, width, height, fps)
+    if edid == previous_edid:
+        raise PocError(
+            f"refusing unnecessary retune: {CONNECTOR_NAME} already exposes the "
+            "requested generated EDID"
+        )
+
+    _sudo_debugfs_preflight()
+    mutated = False
+    try:
+        mutated = True
+        # Deliberately no force-off, unspecified, or EDID reset. The complete
+        # validated override replaces the prior one, force stays on, and AMDGPU
+        # performs virtual HPD redetection.
+        _retune_writes(edid)
+        _, requested_mode, observations = _wait_for_retune_exposed(
+            edid, width, height, fps
+        )
+        _set_kscreen_mode_and_scale(requested_mode.mode_id, 1.0)
+        final_state = _wait_for_current_mode_and_scale(
+            edid, width, height, fps, 1.0
+        )
+    except Exception as error:
+        if mutated:
+            try:
+                _restore_retune_state(
+                    previous_edid, previous_mode, previous_state.scale
+                )
+            except Exception as rollback_error:
+                raise PocError(
+                    f"retune failed: {error}; restoration of the previous synthetic "
+                    f"EDID/state also failed: {rollback_error}. DP-1 may need manual "
+                    "recovery; HDMI-A-1 was not targeted."
+                ) from error
+            raise PocError(
+                f"retune failed and the previous synthetic EDID/mode/scale were restored: {error}"
+            ) from error
+        raise
+
+    final_mode = final_state.current_mode
+    if final_mode is None:
+        raise PocError("KWin lost the verified current mode after retune")
+    print(
+        f"{SYSFS_CONNECTOR_NAME} remained connected and was retuned to "
+        f"{final_mode.width}x{final_mode.height}@{final_mode.refresh_hz:.6f} "
+        f"with scale {final_state.scale:g}."
+    )
+    print(
+        "retune polling observations: "
+        f"samples={observations.samples}, "
+        f"KWin-missing/disabled={observations.kwin_missing_samples}, "
+        f"stale-EDID={observations.stale_edid_samples}, "
+        f"stale-DRM-mode={observations.stale_drm_mode_samples}, "
+        f"stale-KWin-mode={observations.stale_kwin_mode_samples}"
+    )
+    print("kscreen-doctor -o:")
+    print(_kscreen_output())
+    print("HDMI-A-1 was not written or reconfigured.")
+    return 0
+
+
+def command_down() -> int:
+    _require_normal_user()
+    _validate_topology()
+    status = _connector_status()
+    if status == "unknown":
+        raise PocError(f"refusing down: unexpected {SYSFS_CONNECTOR_NAME} status 'unknown'")
+    if status == "connected":
+        try:
+            current_edid = (SYSFS_CONNECTOR / "edid").read_bytes()
+        except OSError as error:
+            raise PocError(f"cannot read current {CONNECTOR_NAME} EDID: {error}") from error
+        if not is_poc_edid(current_edid):
+            raise PocError(
+                f"refusing down: connected {CONNECTOR_NAME} does not expose this POC's "
+                "VDS/0xd150 EDID and may be a physical display"
+            )
+
+    # Confirm KWin can be queried before changing anything.
+    _kscreen_output()
+    _sudo_debugfs_preflight()
+    _teardown_writes()
+    _wait_for_status("disconnected")
+    kscreen = _wait_for_kwin_absent()
+    print(f"{SYSFS_CONNECTOR_NAME} is disconnected and no longer listed by KWin.")
+    print("kscreen-doctor -o:")
+    print(kscreen)
+    print("HDMI-A-1 was not written or reconfigured.")
+    return 0
+
+
+def _debugfs_status() -> str:
+    states: list[str] = []
+    for path in sorted(ALLOWED_WRITE_PATHS, key=str):
+        try:
+            path.stat()
+            states.append(f"{path.name}=present")
+        except PermissionError:
+            states.append(f"{path.name}=permission-denied")
+        except FileNotFoundError:
+            states.append(f"{path.name}=missing")
+        except OSError as error:
+            states.append(f"{path.name}=error:{error}")
+    return ", ".join(states)
+
+
+def command_status() -> int:
+    _require_normal_user()
+    _validate_topology()
+    status = _connector_status()
+    try:
+        edid_size = len((SYSFS_CONNECTOR / "edid").read_bytes())
+        modes = (SYSFS_CONNECTOR / "modes").read_text().splitlines()
+    except OSError as error:
+        raise PocError(f"cannot read connector state: {error}") from error
+    kscreen = _kscreen_output()
+    print(f"target: {SYSFS_CONNECTOR_NAME} ({PCI_SLOT}, amdgpu)")
+    print(f"sysfs status: {status}")
+    print(f"sysfs EDID bytes: {edid_size}")
+    print(f"DRM modes: {', '.join(modes) or '(none)'}")
+    print(f"debugfs controls: {_debugfs_status()}")
+    print("kscreen-doctor -o:")
+    print(kscreen)
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    up = subparsers.add_parser("up", help="generate an EDID and create DP-1")
+    up.add_argument("width", type=int)
+    up.add_argument("height", type=int)
+    up.add_argument("fps", type=float)
+    retune = subparsers.add_parser(
+        "retune", help="replace the EDID of an already-active synthetic DP-1"
+    )
+    retune.add_argument("width", type=int)
+    retune.add_argument("height", type=int)
+    retune.add_argument("fps", type=float)
+    subparsers.add_parser("down", help="remove the POC DP-1 override")
+    subparsers.add_parser("status", help="report DRM, debugfs, and KWin state")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "up":
+            return command_up(args.width, args.height, args.fps)
+        if args.command == "retune":
+            return command_retune(args.width, args.height, args.fps)
+        if args.command == "down":
+            return command_down()
+        return command_status()
+    except (EdidError, PocError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

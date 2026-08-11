@@ -1,0 +1,33 @@
+[Unit]
+Description=Create the persistent DP-1 synthetic DRM connector
+Documentation=file:/usr/local/share/doc/headless-virtual-display/production-design.md
+Wants=sys-kernel-debug.mount
+After=systemd-modules-load.service systemd-udev-trigger.service sys-kernel-debug.mount
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/headless-virtual-display-root apply
+StandardInput=file:/usr/local/share/headless-virtual-display/baseline-1920x1080-60.edid
+RemainAfterExit=yes
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/kernel/debug/dri /run/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @reboot @swap
+
+[Install]
+WantedBy=multi-user.target
