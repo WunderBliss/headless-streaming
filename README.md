@@ -1,232 +1,196 @@
-# Headless Sunshine streaming on AMD Strix Halo
+# Headless virtual display for Sunshine
 
-This project creates a persistent virtual monitor on an otherwise disconnected
-AMDGPU `DP-1` connector, allowing a KDE Plasma Wayland desktop to boot and stream
-through [Sunshine](https://github.com/LizardByte/Sunshine) with no physical
-display attached.
+Headless Virtual Display creates a persistent synthetic monitor on a supported
+AMDGPU connector so KDE Plasma Wayland can boot and Sunshine can stream without a
+physical display. It retunes that monitor to each Moonlight client's requested
+width, height, and frame rate while keeping the connector present for Sunshine's
+startup probe.
 
-Unlike a fixed dummy-plug EDID, the virtual display is retuned for each Moonlight
-client. Sunshine passes the requested width, height, and frame rate to a prep
-command; the command generates a matching EDID, applies it without disconnecting
-the display, configures KWin, and returns only when the requested output is ready
-to capture.
-
-This is working on the machine it was built for, including a cold boot with no
-HDMI display attached, Plasma autologin, dynamic `2560x1600` streaming to a
-tablet, VAAPI encoding, audio, and touch input.
+Version 0.2 removes the original machine-specific source edits. Installation is
+bound through one root-owned configuration to an explicit desktop user, PCI GPU,
+driver, and connector. The unprivileged controller and privileged helper verify
+that binding independently on every operation.
 
 > [!IMPORTANT]
-> This is currently a hardware- and user-specific implementation, not a generic
-> virtual-display installer. It deliberately accepts only AMD PCI device
-> `1002:1586` (Strix Halo), connector `DP-1`, the `amdgpu` driver, and desktop
-> user `owen`. Read the compatibility and installation sections before running
-> anything as root. You will need to adjust for your own usage.
+> The supported stack is currently Arch Linux, systemd, KDE Plasma 6 Wayland,
+> KWin/KScreen, Sunshine KWin capture, and an AMDGPU Display Core device exposing
+> `edid_override`, `force`, and `trigger_hotplug` debugfs controls. AMD Strix Halo
+> `1002:1586` is the tested platform. Setup must pass on other AMDGPU hardware
+> before it should be considered compatible. Intel, NVIDIA, other compositors,
+> and other distributions are not yet supported.
 
-## What it does
-
-- Creates synthetic `DP-1` at a conservative `1920x1080@60` before the display
-  manager starts.
-- Keeps the connector alive independently of Sunshine and Moonlight sessions.
-- Reads `SUNSHINE_CLIENT_WIDTH`, `SUNSHINE_CLIENT_HEIGHT`, and
-  `SUNSHINE_CLIENT_FPS` when an application launches.
-- Uses the exact requested mode whenever it fits the current EDID generator.
-- Falls back to a validated, aspect-preserving mode when it does not.
-- Enables only `DP-1` through KScreen, selects the effective mode, and enforces
-  scale 1.
-- Fails closed if DRM, the synthetic EDID, or KWin state cannot be verified.
-- Leaves physical `HDMI-A-1` configuration alone.
-
-The persistent lifecycle is:
+## How it works
 
 ```text
 boot
-  -> root system service injects the baseline EDID into DP-1
-  -> display manager and Plasma start
-  -> user service verifies DP-1 in KWin at scale 1
-  -> Sunshine starts with DP-1 already available for its capture probe
+  -> root system service applies a conservative 1920x1080@60 EDID
+  -> display manager and the configured Plasma session start
+  -> user service enables the configured connector in KWin at scale 1
+  -> Sunshine starts only after that output is ready
 
 Moonlight launch
-  -> Sunshine prep requests WIDTH x HEIGHT @ FPS
-  -> existing DP-1 is retuned in place
-  -> DRM and KWin state are verified
-  -> Sunshine captures DP-1
-
-disconnect / quit
-  -> DP-1 remains connected at its last successful mode
+  -> Sunshine supplies requested width, height, and FPS
+  -> virtual-display retunes the existing connector in place
+  -> DRM, EDID, KWin mode, and scale are verified
+  -> Sunshine captures the explicitly configured output
 ```
 
-## Compatibility
+The privileged helper accepts only `apply`, `retune`, `remove`, and the read-only
+`probe`. It does not execute a shell, accept paths or topology on the command
+line, import Python, or trust environment variables. Connected physical or
+otherwise unrecognized displays are rejected.
 
-The implementation was developed and tested with:
+## Requirements
 
-- AMD Strix Halo graphics, PCI ID `1002:1586`, using `amdgpu`
-- an unused/disconnected DRM connector named `DP-1`
-- Arch Linux
-- KDE Plasma on Wayland with KWin and KScreen
-- Sunshine using KWin capture and VAAPI encoding
-- systemd system and user services
+Runtime requirements on Arch are:
 
-The privileged helper independently verifies that complete identity and refuses
-ambiguous or unexpected hardware. Supporting another GPU, connector, desktop
-user, or display stack requires a deliberate code review and adaptation; simply
-loosening the checks is not recommended.
+- `python`
+- `kwin` and `libkscreen`
+- `sudo` and `systemd`
+- `v4l-utils` for `edid-decode`
+- Sunshine for Moonlight streaming
+- a kernel with debugfs and the required AMDGPU connector controls
 
-The normal controller is also currently pinned to user `owen`. Before installing
-for another account, update `EXPECTED_DESKTOP_USER` in
-[`scripts/virtual-display`](scripts/virtual-display) and the username in
-[`packaging/sudoers/headless-virtual-display`](packaging/sudoers/headless-virtual-display),
-then review all resulting changes.
+Builds additionally require the normal `base-devel` toolchain.
 
-## Resolution behavior
+## Build and install from source
 
-Exact requests are attempted first. `3840x2160` is a fallback boundary, not a
-global resolution cap.
-
-| Client request | Effective mode | Result |
-| --- | --- | --- |
-| `2560x1600@120` | `2560x1600@120` | exact |
-| `1920x1080@144` | `1920x1080@144` | exact |
-| `1280x800@90` | `1280x800@90` | exact |
-| `3840x2160@90` | `3840x2160@60` | refresh fallback |
-| `5120x2880@60` | `3840x2160@60` | aspect-preserving size fallback |
-
-Fallbacks never upscale the client request merely to fill the bounding box.
-They preserve aspect ratio, fit within `3840x2160`, cap refresh at 60 Hz, and
-must pass both internal validation and `edid-decode`. If progressively smaller
-candidates all fail, the final emergency mode is `1920x1080@60`, with any aspect
-change reported explicitly rather than silently hidden.
-
-Current EDID limitations include a 4095-pixel DTD dimension limit, width divisible
-by 8, a 655.35 MHz pixel-clock limit, and incomplete representation of arbitrary
-high-refresh CVT timings. There is currently no CTA audio, HDR, VRR, DisplayID,
-or extension-block support.
-
-## Components
-
-- [`scripts/virtual-display`](scripts/virtual-display) — unprivileged controller,
-  KWin integration, locking, normalization, verification, and status.
-- [`scripts/edid.py`](scripts/edid.py) — EDID generation, validation, and fallback
-  selection.
-- [`src/headless-virtual-display-root.c`](src/headless-virtual-display-root.c) —
-  narrowly scoped privileged debugfs helper.
-- [`packaging/systemd`](packaging/systemd) — early DRM and graphical-session
-  ordering.
-- [`packaging/sudoers/headless-virtual-display`](packaging/sudoers/headless-virtual-display)
-  — passwordless access to only the root helper's three fixed operations.
-
-The root helper accepts only `apply`, `retune`, and `remove`. EDID data is passed
-through standard input; it does not accept paths or commands, execute a shell,
-or import code from the repository. It validates the GPU, driver, connector,
-debugfs endpoints, EDID structure, checksums, and synthetic identity before
-writing anything.
-
-## Build and installation
-
-Runtime/build requirements include Python 3, a C compiler, GNU Make,
-`edid-decode`, `kscreen-doctor`, `sudo`, systemd, debugfs, Plasma Wayland, and a
-working Sunshine installation.
-
-First review the implementation and run the unprivileged checks:
+The checks are unprivileged and do not touch DRM:
 
 ```bash
 git clone https://github.com/WunderBliss/headless-streaming.git
 cd headless-streaming
 make check
-```
-
-`make check` compiles and tests the helper, validates generated EDIDs, checks the
-sudoers fragment, and verifies the systemd units. It does not touch DRM or install
-anything.
-
-After adapting the hard-coded desktop user if necessary and reviewing the files,
-install the fixed artifacts:
-
-```bash
 sudo make install
 ```
 
-Installation alone does **not** enable services, modify the live Sunshine
-configuration, inject an EDID, restart Sunshine, configure display-manager
-autologin, or reboot. Follow the review-first procedure in
-[`notes/install.md`](notes/install.md) to verify ownership and sudo scope, enable
-the two systemd stages, and merge the Sunshine settings.
+Installation copies root-owned programs, support modules, the baseline EDID, and
+systemd units. It does not choose hardware, write sudoers, enable services,
+change Sunshine, or mutate DRM.
 
-The required Sunshine settings are:
+Discover the available AMDGPU topology:
+
+```bash
+headless-virtual-display-setup discover
+```
+
+Then configure an explicit unused connector. With multiple GPUs, also supply
+`--pci-slot`:
+
+```bash
+sudo headless-virtual-display-setup configure \
+  --user "$USER" \
+  --connector DP-1
+```
+
+Interactive setup can prompt for the connector, but it never silently selects
+one. A connected connector is accepted only when it already exposes this
+project's managed EDID, which permits safe upgrades from the initial release.
+
+Setup writes:
+
+- `/etc/headless-virtual-display/topology.conf`
+- `/etc/sudoers.d/headless-virtual-display`
+- a Sunshine user-unit drop-in when its unit can be identified unambiguously
+
+It validates the configuration, sudoers rule, complete PCI/DRM binding, and
+debugfs controls. It still does not enable or start a service.
+
+Run the reported next steps, beginning with the read-only diagnostic:
+
+```bash
+sudo systemctl daemon-reload
+systemctl --user daemon-reload
+virtual-display doctor
+sudo systemctl enable --now headless-virtual-display-drm.service
+systemctl --user enable --now headless-virtual-display-kwin.service
+virtual-display status
+```
+
+The complete reviewed procedure, including migration and recovery, is in
+[`notes/install.md`](notes/install.md).
+
+## Sunshine configuration
+
+Back up the Sunshine configuration, then merge the values printed by setup:
 
 ```ini
 capture = kwin
 encoder = vaapi
-output_name = DP-1
+output_name = CONFIGURED_CONNECTOR
 global_prep_cmd = [{"do":"/usr/local/bin/virtual-display sunshine-up","undo":""}]
 ```
 
-Leave application-level **Exclude global prep commands** disabled. Do not add an
-undo command that removes the display.
+Use `/usr/bin/virtual-display` instead when installed as an Arch package. Leave
+application-level **Exclude global prep commands** disabled. Do not configure an
+undo command that removes the persistent output.
 
-For a fully unattended cold boot, the selected desktop user must enter a Plasma
-Wayland graphical session automatically; this repository intentionally does not
-configure SDDM autologin or KWallet policy.
+For an unattended cold boot, the configured user must enter a Plasma Wayland
+session without manual input. You may therefore choose display-manager
+autologin, and may need to change or remove the KWallet password so the wallet
+can unlock in that session. Both weaken security: autologin grants anyone with
+physical access immediate desktop access, while an empty or weakened wallet
+password reduces protection for stored credentials. Setup deliberately changes
+neither setting; enable them only after assessing those risks.
 
 ## Usage
 
-Run the controller as the normal Plasma user, never with `sudo`:
+Run the controller as the configured Plasma user, never with `sudo`:
 
 ```bash
-# Inspect DRM, EDID, generated mode, KWin mode/scale, and transient state
+virtual-display doctor
 virtual-display status
-
-# Create or restore the conservative idle mode
 virtual-display baseline
-
-# Apply a manual exact/fallback request
 virtual-display retune 2560 1600 120
-
-# Administrative recovery only; not part of the Sunshine lifecycle
-virtual-display remove
+virtual-display remove       # administrative recovery only
 ```
 
-`sunshine-up` is intended for Sunshine's prep hook and strictly reads its request
-from the three `SUNSHINE_CLIENT_*` environment variables.
+`sunshine-up` is for Sunshine's prep hook and reads only
+`SUNSHINE_CLIENT_WIDTH`, `SUNSHINE_CLIENT_HEIGHT`, and `SUNSHINE_CLIENT_FPS`.
+
+Exact modes are attempted first. Unsupported modes fall back without upscaling,
+preserving aspect ratio within a `3840x2160@60` boundary when possible. The
+emergency mode is `1920x1080@60`. Current base-EDID limitations include a
+4095-pixel detailed-timing dimension limit, a 655.35 MHz clock limit, width
+divisible by eight, and no HDR, VRR, CTA, or DisplayID extensions.
+
+## Arch package
+
+[`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) builds the rolling
+`headless-virtual-display-git` package. A tagged stable package can be produced
+from it after the v0.2 release tag is cut.
 
 ## Verification and recovery
 
-The complete staged validation procedure is in
-[`notes/test-plan.md`](notes/test-plan.md). During the first real stream, verify
-that Sunshine's journal contains:
+During a real stream, Sunshine must log the configured connector, for example:
 
 ```text
 [kwingrab] Screencasting output name DP-1
 ```
 
-This matters because the tested Sunshine KWin capture implementation can fall
-back to its first output if the configured name is missing.
-
 Useful diagnostics are:
 
 ```bash
+virtual-display doctor
 virtual-display status
-journalctl --user -u app-dev.lizardbyte.app.Sunshine.service -b --no-pager
 journalctl --user -u headless-virtual-display-kwin.service -b --no-pager
 sudo journalctl -u headless-virtual-display-drm.service -b --no-pager
 ```
 
-Use `virtual-display baseline` as the first recovery action. Explicit removal and
-the full uninstall sequence are documented in [`notes/install.md`](notes/install.md).
-SSH access is strongly recommended while testing headless boot.
+Use `virtual-display baseline` as the first recovery action. Keep SSH available
+when validating the first headless boot.
 
 ## Documentation
 
-- [`notes/production-design.md`](notes/production-design.md) — architecture,
-  trust boundaries, normalization algorithm, and known risks
-- [`notes/install.md`](notes/install.md) — reviewed installation, Sunshine setup,
-  recovery, and uninstall
-- [`notes/test-plan.md`](notes/test-plan.md) — manual validation from baseline
-  through cold headless boot
-- [`notes/drm-recon.md`](notes/drm-recon.md) — initial AMDGPU/DRM reconnaissance
-- [`notes/edid-poc.md`](notes/edid-poc.md) and
-  [`notes/edid-retune-poc.md`](notes/edid-retune-poc.md) — proof-of-concept history
-- [`notes/sunshine-recon.md`](notes/sunshine-recon.md) — Sunshine capture, encoder,
-  output targeting, and prep ordering research
+- [`notes/production-design.md`](notes/production-design.md) — trust boundaries
+  and runtime design
+- [`notes/install.md`](notes/install.md) — installation, migration, recovery, and
+  uninstall
+- [`notes/test-plan.md`](notes/test-plan.md) — manual release validation
+- [`SECURITY.md`](SECURITY.md) — security policy and safe reporting
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development workflow
+- the remaining files below `notes/` document the original host reconnaissance
+  and proof-of-concept history
 
 ## License
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Create the persistent DP-1 synthetic DRM connector
+Description=Create the configured persistent synthetic DRM connector
 Documentation=file:/usr/local/share/doc/headless-virtual-display/production-design.md
 Wants=sys-kernel-debug.mount
 After=systemd-modules-load.service systemd-udev-trigger.service sys-kernel-debug.mount

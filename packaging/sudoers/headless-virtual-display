@@ -1,6 +1,0 @@
-# Fixed operations only. EDID data is bounded and independently validated on stdin.
-Cmnd_Alias HEADLESS_VIRTUAL_DISPLAY = /usr/local/libexec/headless-virtual-display-root apply, \
-                                     /usr/local/libexec/headless-virtual-display-root retune, \
-                                     /usr/local/libexec/headless-virtual-display-root remove
-
-owen ALL=(root) NOPASSWD: NOEXEC: HEADLESS_VIRTUAL_DISPLAY

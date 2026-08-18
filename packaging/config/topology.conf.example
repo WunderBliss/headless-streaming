@@ -1,0 +1,9 @@
+# Generated installations use exactly these keys and no shell syntax.
+schema_version=1
+desktop_user=replace_me
+desktop_uid=1000
+pci_slot=0000:00:00.0
+pci_vendor=1002
+pci_device=0000
+driver=amdgpu
+connector=DP-1

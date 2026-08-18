@@ -18,11 +18,22 @@
 #define EDID_SIZE 128U
 #define STATUS_SIZE 32U
 #define TEXT_SIZE 64U
-#define CONNECTOR_NAME "DP-1"
-#define EXPECTED_VENDOR "0x1002"
-#define EXPECTED_DEVICE "0x1586"
-#define EXPECTED_DRIVER "amdgpu"
+#define CONFIG_SIZE 4096U
+#define CONFIG_SCHEMA_VERSION 1U
+#ifndef CONFIG_PATH
+#define CONFIG_PATH "/etc/headless-virtual-display/topology.conf"
+#endif
 #define LOCK_PATH "/run/lock/headless-virtual-display-root.lock"
+
+struct runtime_config {
+    char desktop_user[33];
+    unsigned long desktop_uid;
+    char pci_slot[13];
+    char pci_vendor[5];
+    char pci_device[5];
+    char driver[33];
+    char connector[65];
+};
 
 struct topology {
     char pci_slot[32];
@@ -78,6 +89,267 @@ static bool is_card_name(const char *value)
         }
     }
     return true;
+}
+
+static bool copy_config_value(char *destination, size_t capacity,
+                              const char *value)
+{
+    size_t length = strlen(value);
+    if (length == 0U || length >= capacity) {
+        return false;
+    }
+    memcpy(destination, value, length + 1U);
+    return true;
+}
+
+static bool is_safe_user(const char *value)
+{
+    size_t length = strlen(value);
+    if (length == 0U || length > 32U ||
+        !(isalpha((unsigned char)value[0]) || value[0] == '_')) {
+        return false;
+    }
+    for (size_t index = 1U; index < length; ++index) {
+        if (!(isalnum((unsigned char)value[index]) || value[index] == '_' ||
+              value[index] == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_lower_hex4(const char *value)
+{
+    if (strlen(value) != 4U) {
+        return false;
+    }
+    for (size_t index = 0U; index < 4U; ++index) {
+        if (!(isdigit((unsigned char)value[index]) ||
+              (value[index] >= 'a' && value[index] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_safe_driver(const char *value)
+{
+    size_t length = strlen(value);
+    if (length == 0U || length > 32U) {
+        return false;
+    }
+    for (size_t index = 0U; index < length; ++index) {
+        if (!(islower((unsigned char)value[index]) ||
+              isdigit((unsigned char)value[index]) || value[index] == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_safe_connector(const char *value)
+{
+    size_t length = strlen(value);
+    if (length < 2U || length > 64U ||
+        !isalnum((unsigned char)value[0])) {
+        return false;
+    }
+    for (size_t index = 1U; index < length; ++index) {
+        if (!(isalnum((unsigned char)value[index]) || value[index] == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_decimal(const char *value, unsigned long maximum,
+                          unsigned long *result)
+{
+    if (value[0] == '\0' || (value[0] == '0' && value[1] != '\0')) {
+        return false;
+    }
+    for (const char *cursor = value; *cursor != '\0'; ++cursor) {
+        if (!isdigit((unsigned char)*cursor)) {
+            return false;
+        }
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0' || parsed == 0U ||
+        parsed > maximum) {
+        return false;
+    }
+    *result = parsed;
+    return true;
+}
+
+static bool parse_config_text(char *text, struct runtime_config *config)
+{
+    enum {
+        SEEN_SCHEMA = 1U << 0U,
+        SEEN_USER = 1U << 1U,
+        SEEN_UID = 1U << 2U,
+        SEEN_SLOT = 1U << 3U,
+        SEEN_VENDOR = 1U << 4U,
+        SEEN_DEVICE = 1U << 5U,
+        SEEN_DRIVER = 1U << 6U,
+        SEEN_CONNECTOR = 1U << 7U,
+        SEEN_ALL = (1U << 8U) - 1U,
+    };
+    unsigned int seen = 0U;
+    unsigned long schema = 0U;
+    char *save = NULL;
+    unsigned int line_number = 0U;
+    for (char *line = strtok_r(text, "\n", &save); line != NULL;
+         line = strtok_r(NULL, "\n", &save)) {
+        ++line_number;
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+        if (strchr(line, '\r') != NULL || strchr(line, ' ') != NULL ||
+            strchr(line, '\t') != NULL) {
+            fprintf(stderr,
+                    "headless-virtual-display-root: invalid whitespace on config line %u\n",
+                    line_number);
+            return false;
+        }
+        char *separator = strchr(line, '=');
+        if (separator == NULL || separator == line || separator[1] == '\0' ||
+            strchr(separator + 1, '=') != NULL) {
+            fprintf(stderr,
+                    "headless-virtual-display-root: invalid config syntax on line %u\n",
+                    line_number);
+            return false;
+        }
+        *separator = '\0';
+        const char *key = line;
+        const char *value = separator + 1;
+        unsigned int bit = 0U;
+        bool valid = false;
+        if (strcmp(key, "schema_version") == 0) {
+            bit = SEEN_SCHEMA;
+            valid = parse_decimal(value, 999U, &schema) &&
+                    schema == CONFIG_SCHEMA_VERSION;
+        } else if (strcmp(key, "desktop_user") == 0) {
+            bit = SEEN_USER;
+            valid = is_safe_user(value) &&
+                    copy_config_value(config->desktop_user,
+                                      sizeof(config->desktop_user), value);
+        } else if (strcmp(key, "desktop_uid") == 0) {
+            bit = SEEN_UID;
+            valid = parse_decimal(value, 2147483647UL,
+                                  &config->desktop_uid);
+        } else if (strcmp(key, "pci_slot") == 0) {
+            bit = SEEN_SLOT;
+            valid = is_pci_slot(value) &&
+                    copy_config_value(config->pci_slot,
+                                      sizeof(config->pci_slot), value);
+        } else if (strcmp(key, "pci_vendor") == 0) {
+            bit = SEEN_VENDOR;
+            valid = is_lower_hex4(value) &&
+                    copy_config_value(config->pci_vendor,
+                                      sizeof(config->pci_vendor), value);
+        } else if (strcmp(key, "pci_device") == 0) {
+            bit = SEEN_DEVICE;
+            valid = is_lower_hex4(value) &&
+                    copy_config_value(config->pci_device,
+                                      sizeof(config->pci_device), value);
+        } else if (strcmp(key, "driver") == 0) {
+            bit = SEEN_DRIVER;
+            valid = is_safe_driver(value) &&
+                    copy_config_value(config->driver,
+                                      sizeof(config->driver), value);
+        } else if (strcmp(key, "connector") == 0) {
+            bit = SEEN_CONNECTOR;
+            valid = is_safe_connector(value) &&
+                    copy_config_value(config->connector,
+                                      sizeof(config->connector), value);
+        } else {
+            fprintf(stderr,
+                    "headless-virtual-display-root: unknown config key %s\n",
+                    key);
+            return false;
+        }
+        if ((seen & bit) != 0U || !valid) {
+            fprintf(stderr,
+                    "headless-virtual-display-root: duplicate or invalid config key %s\n",
+                    key);
+            return false;
+        }
+        seen |= bit;
+    }
+    if (seen != SEEN_ALL) {
+        fprintf(stderr,
+                "headless-virtual-display-root: topology config is incomplete\n");
+        return false;
+    }
+    return true;
+}
+
+static bool load_config(struct runtime_config *config)
+{
+    struct stat before;
+    if (lstat(CONFIG_PATH, &before) != 0) {
+        report_errno("cannot inspect config", CONFIG_PATH);
+        return false;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_uid != 0U ||
+        (before.st_mode & 0022U) != 0U) {
+        fprintf(stderr,
+                "headless-virtual-display-root: unsafe topology config metadata: %s\n",
+                CONFIG_PATH);
+        return false;
+    }
+    int descriptor = open(CONFIG_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        report_errno("cannot open config", CONFIG_PATH);
+        return false;
+    }
+    struct stat after;
+    if (fstat(descriptor, &after) != 0 || before.st_dev != after.st_dev ||
+        before.st_ino != after.st_ino || !S_ISREG(after.st_mode) ||
+        after.st_uid != 0U || (after.st_mode & 0022U) != 0U) {
+        fprintf(stderr,
+                "headless-virtual-display-root: topology config changed or is unsafe\n");
+        close(descriptor);
+        return false;
+    }
+    char text[CONFIG_SIZE + 1U];
+    size_t used = 0U;
+    while (used < sizeof(text)) {
+        ssize_t amount = read(descriptor, text + used, sizeof(text) - used);
+        if (amount < 0 && errno == EINTR) {
+            continue;
+        }
+        if (amount < 0) {
+            report_errno("cannot read config", CONFIG_PATH);
+            close(descriptor);
+            return false;
+        }
+        if (amount == 0) {
+            break;
+        }
+        used += (size_t)amount;
+    }
+    bool close_ok = close(descriptor) == 0;
+    if (!close_ok) {
+        report_errno("cannot close config", CONFIG_PATH);
+    }
+    if (!close_ok || used == 0U || used > CONFIG_SIZE) {
+        fprintf(stderr,
+                "headless-virtual-display-root: topology config must contain 1..%u bytes\n",
+                CONFIG_SIZE);
+        return false;
+    }
+    if (memchr(text, '\0', used) != NULL) {
+        fprintf(stderr,
+                "headless-virtual-display-root: topology config contains a NUL byte\n");
+        return false;
+    }
+    text[used] = '\0';
+    memset(config, 0, sizeof(*config));
+    return parse_config_text(text, config);
 }
 
 static bool read_bounded_file(const char *path, uint8_t *buffer,
@@ -193,7 +465,8 @@ static bool find_card(const char *pci_path, char *card_name, size_t size)
     return true;
 }
 
-static bool inspect_pci_device(const char *slot, struct topology *candidate)
+static bool inspect_pci_device(const struct runtime_config *config,
+                               struct topology *candidate)
 {
     char device_path[PATH_MAX];
     char vendor_path[PATH_MAX];
@@ -204,7 +477,8 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
     char device_id[TEXT_SIZE];
 
     int device_path_written = snprintf(device_path, sizeof(device_path),
-                                       "/sys/bus/pci/devices/%s", slot);
+                                       "/sys/bus/pci/devices/%s",
+                                       config->pci_slot);
     if (device_path_written < 0 ||
         (size_t)device_path_written >= sizeof(device_path) ||
         !append_path(vendor_path, sizeof(vendor_path), device_path, "vendor") ||
@@ -216,15 +490,22 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
         !read_text(device_id_path, device_id, sizeof(device_id))) {
         return false;
     }
-    if (strcmp(vendor, EXPECTED_VENDOR) != 0 ||
-        strcmp(device_id, EXPECTED_DEVICE) != 0) {
+    char expected_vendor[7];
+    char expected_device[7];
+    int vendor_written = snprintf(expected_vendor, sizeof(expected_vendor),
+                                  "0x%s", config->pci_vendor);
+    int device_written = snprintf(expected_device, sizeof(expected_device),
+                                  "0x%s", config->pci_device);
+    if (vendor_written != 6 || device_written != 6 ||
+        strcmp(vendor, expected_vendor) != 0 ||
+        strcmp(device_id, expected_device) != 0) {
         return false;
     }
     if (realpath(driver_path, resolved_driver) == NULL) {
         report_errno("cannot resolve driver", driver_path);
         return false;
     }
-    if (strcmp(last_component(resolved_driver), EXPECTED_DRIVER) != 0) {
+    if (strcmp(last_component(resolved_driver), config->driver) != 0) {
         return false;
     }
     if (realpath(device_path, candidate->pci_path) == NULL) {
@@ -252,7 +533,7 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
     char resolved_connector[PATH_MAX];
     int connector_written = snprintf(connector_name, sizeof(connector_name),
                                      "%s-%s", candidate->card_name,
-                                     CONNECTOR_NAME);
+                                     config->connector);
     int drm_path_written = snprintf(drm_card_path, sizeof(drm_card_path),
                                     "%s/drm/%s", candidate->pci_path,
                                     candidate->card_name);
@@ -265,12 +546,12 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
         return false;
     }
     if (realpath(unresolved_connector, resolved_connector) == NULL) {
-        report_errno("cannot resolve DP-1 connector", unresolved_connector);
+        report_errno("cannot resolve configured connector", unresolved_connector);
         return false;
     }
     if (!path_belongs_to(resolved_connector, candidate->pci_path)) {
         fprintf(stderr,
-                "headless-virtual-display-root: DP-1 resolves outside the target PCI device\n");
+                "headless-virtual-display-root: configured connector resolves outside the target PCI device\n");
         return false;
     }
     int connector_path_written = snprintf(
@@ -278,7 +559,8 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
         resolved_connector);
     int debugfs_path_written = snprintf(
         candidate->debugfs_path, sizeof(candidate->debugfs_path),
-        "/sys/kernel/debug/dri/%s/%s", candidate->pci_slot, CONNECTOR_NAME);
+        "/sys/kernel/debug/dri/%s/%s", candidate->pci_slot,
+        config->connector);
     if (connector_path_written < 0 ||
         (size_t)connector_path_written >= sizeof(candidate->connector_path) ||
         debugfs_path_written < 0 ||
@@ -288,45 +570,14 @@ static bool inspect_pci_device(const char *slot, struct topology *candidate)
     return true;
 }
 
-static bool discover_topology(struct topology *result)
+static bool discover_topology(const struct runtime_config *config,
+                              struct topology *result)
 {
-    DIR *directory = opendir("/sys/bus/pci/devices");
-    if (directory == NULL) {
-        report_errno("cannot open", "/sys/bus/pci/devices");
-        return false;
-    }
-    unsigned int matches = 0;
-    struct dirent *entry = NULL;
-    int saved_errno = 0;
-    for (;;) {
-        errno = 0;
-        entry = readdir(directory);
-        if (entry == NULL) {
-            saved_errno = errno;
-            break;
-        }
-        if (!is_pci_slot(entry->d_name)) {
-            continue;
-        }
-        struct topology candidate = {0};
-        if (inspect_pci_device(entry->d_name, &candidate)) {
-            *result = candidate;
-            ++matches;
-        }
-    }
-    if (closedir(directory) != 0) {
-        report_errno("cannot close", "/sys/bus/pci/devices");
-        return false;
-    }
-    if (saved_errno != 0) {
-        errno = saved_errno;
-        report_errno("cannot enumerate", "/sys/bus/pci/devices");
-        return false;
-    }
-    if (matches != 1U) {
+    if (!inspect_pci_device(config, result)) {
         fprintf(stderr,
-                "headless-virtual-display-root: expected exactly one 1002:1586 amdgpu PCI device with DP-1, found %u\n",
-                matches);
+                "headless-virtual-display-root: configured topology %s %s:%s %s/%s did not match\n",
+                config->pci_slot, config->pci_vendor, config->pci_device,
+                config->driver, config->connector);
         return false;
     }
     return true;
@@ -363,10 +614,15 @@ static bool validate_edid(const uint8_t edid[EDID_SIZE])
                 "headless-virtual-display-root: EDID header/version/flags/block/checksum validation failed\n");
         return false;
     }
+    bool current_identity =
+        memcmp(edid + 72, "\0\0\0\xfc\0HEADLESS-VDS\n", 18) == 0 &&
+        memcmp(edid + 90, "\0\0\0\xff\0HVD-00000001\n", 18) == 0;
+    bool legacy_identity =
+        memcmp(edid + 72, "\0\0\0\xfc\0VIRTUAL-POC\n ", 18) == 0 &&
+        memcmp(edid + 90, "\0\0\0\xff\0VDS-POC-0001\n", 18) == 0;
     if (!decode_manufacturer(edid) || edid[10] != 0x50U ||
         edid[11] != 0xd1U || memcmp(edid + 12, "\0\0\0\0", 4) != 0 ||
-        memcmp(edid + 72, "\0\0\0\xfc\0VIRTUAL-POC\n ", 18) != 0 ||
-        memcmp(edid + 90, "\0\0\0\xff\0VDS-POC-0001\n", 18) != 0 ||
+        (!current_identity && !legacy_identity) ||
         memcmp(edid + 108, dummy_descriptor, sizeof(dummy_descriptor)) != 0) {
         fprintf(stderr,
                 "headless-virtual-display-root: EDID does not have the full managed VDS identity\n");
@@ -451,8 +707,8 @@ static bool read_status(const struct topology *topology,
     if (strcmp(status, "connected") != 0 &&
         strcmp(status, "disconnected") != 0) {
         fprintf(stderr,
-                "headless-virtual-display-root: refusing unexpected DP-1 status %s\n",
-                status);
+                "headless-virtual-display-root: refusing unexpected %s status %s\n",
+                last_component(topology->debugfs_path), status);
         return false;
     }
     return true;
@@ -472,7 +728,8 @@ static bool read_current_edid(const struct topology *topology,
     }
     if (amount > EDID_SIZE) {
         fprintf(stderr,
-                "headless-virtual-display-root: current DP-1 EDID exceeds the managed size\n");
+                "headless-virtual-display-root: current %s EDID exceeds the managed size\n",
+                last_component(topology->debugfs_path));
         return false;
     }
     memcpy(edid, bounded, amount);
@@ -622,13 +879,15 @@ static int run_apply_or_retune(const struct topology *topology,
     bool connected = strcmp(status, "connected") == 0;
     if (strcmp(operation, "retune") == 0 && !connected) {
         fprintf(stderr,
-                "headless-virtual-display-root: retune requires an already-connected DP-1\n");
+                "headless-virtual-display-root: retune requires an already-connected %s\n",
+                last_component(topology->debugfs_path));
         return 1;
     }
     if (connected &&
         (previous_length != EDID_SIZE || !validate_edid(previous_edid))) {
         fprintf(stderr,
-                "headless-virtual-display-root: refusing to manipulate connected DP-1 with an unrecognized physical/unmanaged EDID\n");
+                "headless-virtual-display-root: refusing to manipulate connected %s with an unrecognized physical/unmanaged EDID\n",
+                last_component(topology->debugfs_path));
         return 1;
     }
     if (!apply_writes(topology, new_edid)) {
@@ -640,11 +899,13 @@ static int run_apply_or_retune(const struct topology *topology,
                                : remove_writes(topology);
         if (!rollback_ok) {
             fprintf(stderr,
-                    "headless-virtual-display-root: rollback also failed; DP-1 needs administrative recovery\n");
+                    "headless-virtual-display-root: rollback also failed; %s needs administrative recovery\n",
+                    last_component(topology->debugfs_path));
         }
         return 1;
     }
-    printf("%s accepted for %s on %s\n", operation, CONNECTOR_NAME,
+    printf("%s accepted for %s on %s\n", operation,
+           last_component(topology->debugfs_path),
            topology->pci_slot);
     return 0;
 }
@@ -661,7 +922,8 @@ static int run_remove(const struct topology *topology)
     if (strcmp(status, "connected") == 0 &&
         (current_length != EDID_SIZE || !validate_edid(current_edid))) {
         fprintf(stderr,
-                "headless-virtual-display-root: refusing to remove connected DP-1 with an unrecognized physical/unmanaged EDID\n");
+                "headless-virtual-display-root: refusing to remove connected %s with an unrecognized physical/unmanaged EDID\n",
+                last_component(topology->debugfs_path));
         return 1;
     }
     if (!remove_writes(topology)) {
@@ -669,14 +931,15 @@ static int run_remove(const struct topology *topology)
                 "headless-virtual-display-root: remove writes were incomplete\n");
         return 1;
     }
-    printf("remove accepted for %s on %s\n", CONNECTOR_NAME,
+    printf("remove accepted for %s on %s\n",
+           last_component(topology->debugfs_path),
            topology->pci_slot);
     return 0;
 }
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s {apply|retune|remove}\n", program);
+    fprintf(stderr, "usage: %s {apply|retune|remove|probe}\n", program);
     fprintf(stderr,
             "apply/retune read exactly one validated 128-byte managed EDID from stdin\n");
 }
@@ -692,13 +955,20 @@ int main(int argc, char **argv)
     if (argc != 2 ||
         (strcmp(argv[1], "apply") != 0 &&
          strcmp(argv[1], "retune") != 0 &&
-         strcmp(argv[1], "remove") != 0)) {
+         strcmp(argv[1], "remove") != 0 &&
+         strcmp(argv[1], "probe") != 0)) {
         usage(argv[0]);
         return 2;
     }
 
     uint8_t input_edid[EDID_SIZE] = {0};
-    if (strcmp(argv[1], "remove") != 0 && !read_stdin_edid(input_edid)) {
+    if (strcmp(argv[1], "apply") == 0 || strcmp(argv[1], "retune") == 0) {
+        if (!read_stdin_edid(input_edid)) {
+            return 1;
+        }
+    }
+    struct runtime_config config = {0};
+    if (!load_config(&config)) {
         return 1;
     }
     int lock_descriptor = acquire_lock();
@@ -707,10 +977,32 @@ int main(int argc, char **argv)
     }
     struct topology topology = {0};
     int result = 1;
-    if (discover_topology(&topology)) {
-        result = strcmp(argv[1], "remove") == 0
-                     ? run_remove(&topology)
-                     : run_apply_or_retune(&topology, argv[1], input_edid);
+    if (discover_topology(&config, &topology)) {
+        if (strcmp(argv[1], "remove") == 0) {
+            result = run_remove(&topology);
+        } else if (strcmp(argv[1], "probe") == 0) {
+            static const char *controls[] = {
+                "edid_override", "force", "trigger_hotplug",
+            };
+            result = 0;
+            for (size_t index = 0U;
+                 index < sizeof(controls) / sizeof(controls[0]); ++index) {
+                int descriptor = -1;
+                if (!open_control(&topology, controls[index], &descriptor) ||
+                    close(descriptor) != 0) {
+                    result = 1;
+                    break;
+                }
+            }
+            if (result == 0) {
+                printf("probe accepted for %s on %s (%s %s:%s, user %s/%lu)\n",
+                       config.connector, topology.pci_slot, config.driver,
+                       config.pci_vendor, config.pci_device,
+                       config.desktop_user, config.desktop_uid);
+            }
+        } else {
+            result = run_apply_or_retune(&topology, argv[1], input_edid);
+        }
     }
     if (flock(lock_descriptor, LOCK_UN) != 0) {
         report_errno("cannot unlock", LOCK_PATH);
