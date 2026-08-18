@@ -1,0 +1,80 @@
+name: Work item
+description: Propose a feature, improvement, bug fix, research task, or documentation change.
+title: ""
+labels: []
+assignees: []
+body:
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      description: Choose the category that best describes this work.
+      options:
+        - Feature
+        - Improvement
+        - Bug
+        - Research / spike
+        - Documentation
+        - Maintenance
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the desired outcome clearly and concisely.
+      placeholder: What should change or become possible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / context
+      description: Explain the problem, user need, or technical constraint behind this work.
+      placeholder: Why is this useful, and who or what is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_work
+    attributes:
+      label: Proposed work
+      description: Outline a likely implementation approach when one is already known.
+      placeholder: Describe the expected components, interfaces, or design direction.
+
+  - type: textarea
+    id: completion_criteria
+    attributes:
+      label: Completion criteria
+      description: List observable conditions that must be true before this issue can close.
+      placeholder: |
+        - [ ] The primary behavior is implemented.
+        - [ ] Failure and recovery behavior is documented.
+        - [ ] Automated or repeatable validation covers the change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Explain how the completion criteria will be verified.
+      placeholder: Tests, hardware matrix, manual checks, logs, or measurements.
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of scope
+      description: Record related work that this issue deliberately does not include.
+      placeholder: Optional boundaries that keep this work reviewable.
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies / notes
+      description: Link prerequisites, related issues, design notes, or external constraints.
+      placeholder: Optional dependencies, risks, or follow-up work.
