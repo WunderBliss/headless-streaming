@@ -16,7 +16,7 @@ jobs:
       - name: Install runtime and check dependencies
         run: pacman -Syu --noconfirm git kwin libkscreen python sudo systemd v4l-utils ripgrep
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Mark checkout safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
