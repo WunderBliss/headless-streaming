@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""Discover and configure a supported headless-virtual-display installation."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+
+
+VERSION = "0.2.0"
+SUNSHINE_UNIT_DEFAULT = "app-dev.lizardbyte.app.Sunshine.service"
+SUPPORTED_VENDOR = "1002"
+SUPPORTED_DRIVER = "amdgpu"
+SUDOERS_PATH = Path("/etc/sudoers.d/headless-virtual-display")
+SYSTEMD_USER_DIR = Path("/etc/systemd/user")
+VISUDO = Path("/usr/bin/visudo")
+UNIT_NAME = re.compile(r"[A-Za-z0-9_.@-]+\.service")
+PCI_SLOT = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-1][0-9a-f]\.[0-7]")
+
+
+class SetupError(RuntimeError):
+    """A user-facing setup failure."""
+
+
+def _prefix() -> Path:
+    script = Path(__file__).resolve()
+    return script.parent.parent if script.parent.name == "bin" else Path("/usr/local")
+
+
+PREFIX = _prefix()
+ROOT_HELPER = PREFIX / "libexec/headless-virtual-display-root"
+VIRTUAL_DISPLAY = PREFIX / "bin/virtual-display"
+
+
+def _load_module(filename: str, module_name: str) -> ModuleType:
+    script = Path(__file__).resolve()
+    development = script.parent / filename
+    path = (
+        development
+        if development.is_file()
+        else PREFIX / "lib/headless-virtual-display" / filename
+    )
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        raise SetupError(f"support module is unavailable at {path}: {error}") from error
+    if path != development and (metadata.st_uid != 0 or metadata.st_mode & 0o022):
+        raise SetupError(
+            f"installed support module must be root-owned and not group/other-writable: {path}"
+        )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise SetupError(f"cannot load support module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+CONFIG = _load_module("config.py", "headless_virtual_display_setup_config")
+EDID = _load_module("edid.py", "headless_virtual_display_setup_edid")
+
+
+@dataclass(frozen=True)
+class Connector:
+    name: str
+    status: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class Gpu:
+    pci_slot: str
+    vendor: str
+    device: str
+    driver: str
+    card_name: str
+    connectors: tuple[Connector, ...]
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError as error:
+        raise SetupError(f"cannot read {path}: {error}") from error
+
+
+def discover() -> tuple[Gpu, ...]:
+    results: list[Gpu] = []
+    for device_path in sorted(Path("/sys/bus/pci/devices").iterdir()):
+        if not PCI_SLOT.fullmatch(device_path.name):
+            continue
+        try:
+            vendor = _read(device_path / "vendor").removeprefix("0x").lower()
+            device = _read(device_path / "device").removeprefix("0x").lower()
+            driver = (device_path / "driver").resolve(strict=True).name
+        except (OSError, SetupError):
+            continue
+        if vendor != SUPPORTED_VENDOR or driver != SUPPORTED_DRIVER:
+            continue
+        cards = sorted(
+            path
+            for path in (device_path / "drm").glob("card[0-9]*")
+            if "-" not in path.name
+        )
+        if len(cards) != 1:
+            continue
+        card = cards[0]
+        connectors: list[Connector] = []
+        for path in sorted(Path("/sys/class/drm").glob(f"{card.name}-*")):
+            name = path.name.removeprefix(f"{card.name}-")
+            status_path = path / "status"
+            if not status_path.is_file():
+                continue
+            try:
+                status = _read(status_path)
+            except SetupError:
+                continue
+            connectors.append(Connector(name=name, status=status, path=path))
+        results.append(
+            Gpu(
+                pci_slot=device_path.name,
+                vendor=vendor,
+                device=device,
+                driver=driver,
+                card_name=card.name,
+                connectors=tuple(connectors),
+            )
+        )
+    return tuple(results)
+
+
+def _print_discovery(gpus: tuple[Gpu, ...]) -> None:
+    if not gpus:
+        print("No supported AMDGPU DRM device was found.")
+        return
+    for gpu in gpus:
+        print(
+            f"{gpu.pci_slot} {gpu.vendor}:{gpu.device} {gpu.driver} {gpu.card_name}"
+        )
+        for connector in gpu.connectors:
+            controls = Path("/sys/kernel/debug/dri") / gpu.pci_slot / connector.name
+            control_state = (
+                "controls=yes"
+                if all(
+                    (controls / name).is_file()
+                    for name in ("edid_override", "force", "trigger_hotplug")
+                )
+                else "controls=unknown/no"
+            )
+            print(f"  {connector.name}: {connector.status}, {control_state}")
+
+
+def _select_gpu(gpus: tuple[Gpu, ...], slot: str | None) -> Gpu:
+    if slot is not None:
+        matches = [gpu for gpu in gpus if gpu.pci_slot == slot]
+        if len(matches) != 1:
+            raise SetupError(f"configured PCI slot {slot} is not a supported AMDGPU device")
+        return matches[0]
+    if len(gpus) == 1:
+        return gpus[0]
+    if not sys.stdin.isatty():
+        raise SetupError("use --pci-slot when more than one supported GPU is present")
+    _print_discovery(gpus)
+    answer = input("PCI slot to configure: ").strip()
+    return _select_gpu(gpus, answer)
+
+
+def _select_connector(gpu: Gpu, requested: str | None) -> Connector:
+    if requested is not None:
+        matches = [connector for connector in gpu.connectors if connector.name == requested]
+        if len(matches) != 1:
+            raise SetupError(
+                f"connector {requested!r} does not exist on configured GPU {gpu.pci_slot}"
+            )
+        return matches[0]
+    if not sys.stdin.isatty():
+        raise SetupError("use --connector to select the target explicitly")
+    print("Available connectors (choose an unused/disconnected connector):")
+    for connector in gpu.connectors:
+        print(f"  {connector.name}: {connector.status}")
+    answer = input("Connector to dedicate to the virtual display: ").strip()
+    return _select_connector(gpu, answer)
+
+
+def _managed_connected_connector(connector: Connector) -> bool:
+    if connector.status != "connected":
+        return False
+    try:
+        data = (connector.path / "edid").read_bytes()
+        EDID.validate_edid(data, require_managed_identity=True)
+    except (OSError, EDID.EdidError):
+        return False
+    return True
+
+
+def _validate_target(gpu: Gpu, connector: Connector) -> None:
+    if connector.status == "connected" and not _managed_connected_connector(connector):
+        raise SetupError(
+            f"refusing connected connector {connector.name}: its EDID is not managed by this project"
+        )
+    if connector.status not in {"connected", "disconnected"}:
+        raise SetupError(
+            f"refusing connector {connector.name} with status {connector.status!r}"
+        )
+    debugfs = Path("/sys/kernel/debug/dri") / gpu.pci_slot / connector.name
+    for name in ("edid_override", "force", "trigger_hotplug"):
+        path = debugfs / name
+        try:
+            metadata = path.stat()
+        except OSError as error:
+            raise SetupError(f"required debugfs control is unavailable: {path}: {error}") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o022
+        ):
+            raise SetupError(f"unsafe debugfs control metadata: {path}")
+
+
+def _atomic_write(path: Path, content: str, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    parent_metadata = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_mode & 0o022
+    ):
+        raise SetupError(f"unsafe destination directory: {path.parent}")
+    if path.is_symlink():
+        raise SetupError(f"refusing to replace symlink: {path}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sudoers_text(user: str, helper_path: Path = ROOT_HELPER) -> str:
+    helper = str(helper_path)
+    return (
+        "# Generated by headless-virtual-display-setup. Fixed operations only.\n"
+        f"Cmnd_Alias HEADLESS_VIRTUAL_DISPLAY = {helper} apply, \\\n"
+        f"                                     {helper} retune, \\\n"
+        f"                                     {helper} remove, \\\n"
+        f"                                     {helper} probe\n\n"
+        f"{user} ALL=(root) NOPASSWD: NOEXEC: HEADLESS_VIRTUAL_DISPLAY\n"
+    )
+
+
+def _write_sudoers(user: str, *, dry_run: bool) -> None:
+    content = _sudoers_text(user)
+    if dry_run:
+        print(f"would write {SUDOERS_PATH}")
+        return
+    if not VISUDO.is_file():
+        raise SetupError(f"visudo is unavailable at {VISUDO}")
+    SUDOERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    parent_metadata = SUDOERS_PATH.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_mode & 0o022
+    ):
+        raise SetupError(f"unsafe sudoers directory: {SUDOERS_PATH.parent}")
+    descriptor, name = tempfile.mkstemp(prefix=".headless-virtual-display.", dir=SUDOERS_PATH.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o440)
+        os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        result = subprocess.run(
+            [str(VISUDO), "-cf", str(temporary)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode:
+            output = (result.stdout + result.stderr).strip()
+            raise SetupError(f"generated sudoers rule failed validation: {output}")
+        if SUDOERS_PATH.is_symlink():
+            raise SetupError(f"refusing to replace symlink: {SUDOERS_PATH}")
+        os.replace(temporary, SUDOERS_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _detect_sunshine_unit(requested: str | None) -> str | None:
+    if requested:
+        if not UNIT_NAME.fullmatch(requested):
+            raise SetupError("Sunshine unit name contains unsupported characters")
+        return requested
+    candidates: list[str] = []
+    for unit in (SUNSHINE_UNIT_DEFAULT, "sunshine.service"):
+        if any(
+            (directory / unit).is_file()
+            for directory in (Path("/etc/systemd/user"), Path("/usr/lib/systemd/user"))
+        ):
+            candidates.append(unit)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _write_sunshine_dropin(unit: str | None, *, dry_run: bool) -> None:
+    if unit is None:
+        print("Sunshine unit was not uniquely detected; no service drop-in will be written.")
+        return
+    path = SYSTEMD_USER_DIR / f"{unit}.d/50-headless-virtual-display.conf"
+    content = (
+        "[Unit]\n"
+        "Requires=headless-virtual-display-kwin.service\n"
+        "After=headless-virtual-display-kwin.service\n"
+    )
+    if dry_run:
+        print(f"would write {path}")
+    else:
+        _atomic_write(path, content, 0o644)
+        print(f"wrote Sunshine ordering drop-in: {path}")
+
+
+def _print_next_steps(config, unit: str | None) -> None:
+    print("\nConfiguration complete. No service was enabled or started.")
+    print("Next steps (run the user commands as the configured desktop user):")
+    print("  sudo systemctl daemon-reload")
+    print("  systemctl --user daemon-reload")
+    print(f"  {VIRTUAL_DISPLAY} doctor")
+    print("  sudo systemctl enable --now headless-virtual-display-drm.service")
+    print("  systemctl --user enable --now headless-virtual-display-kwin.service")
+    print("\nMerge these Sunshine settings after backing up its configuration:")
+    print("  capture = kwin")
+    print("  encoder = vaapi")
+    print(f"  output_name = {config.connector}")
+    print(
+        "  global_prep_cmd = "
+        f"[{{\"do\":\"{VIRTUAL_DISPLAY} sunshine-up\",\"undo\":\"\"}}]"
+    )
+    if unit is None:
+        print("  Also add Sunshine service ordering manually; see the install guide.")
+    print(
+        "\nFor unattended cold boot, the desktop session must start without manual input. "
+        "You may choose to enable display-manager autologin and may need to change or "
+        "remove the KWallet password so the wallet can unlock in that session. Both choices "
+        "reduce security: autologin grants local users immediate desktop access, and an empty "
+        "or weakened wallet password reduces protection for stored credentials. This setup "
+        "does not change either setting; enable them only after assessing the machine's "
+        "physical-access and credential risks."
+    )
+
+
+def configure(args) -> None:
+    if os.geteuid() != 0:
+        raise SetupError("configure must run as root (for example, with sudo)")
+    try:
+        account = pwd.getpwnam(args.user)
+    except KeyError as error:
+        raise SetupError(f"desktop user does not exist: {args.user}") from error
+    if account.pw_uid == 0:
+        raise SetupError("the configured desktop user must not be root")
+    if account.pw_name == "ALL":
+        raise SetupError("desktop username ALL conflicts with sudoers syntax")
+
+    gpus = discover()
+    if not gpus:
+        raise SetupError("no supported AMDGPU DRM device was found")
+    gpu = _select_gpu(gpus, args.pci_slot)
+    connector = _select_connector(gpu, args.connector)
+    _validate_target(gpu, connector)
+    configuration = CONFIG.RuntimeConfig(
+        schema_version=CONFIG.CONFIG_SCHEMA_VERSION,
+        desktop_user=account.pw_name,
+        desktop_uid=account.pw_uid,
+        pci_slot=gpu.pci_slot,
+        pci_vendor=gpu.vendor,
+        pci_device=gpu.device,
+        driver=gpu.driver,
+        connector=connector.name,
+    )
+    CONFIG.parse_config_text(configuration.text())
+    unit = _detect_sunshine_unit(args.sunshine_unit)
+
+    if args.dry_run:
+        print(f"would write {CONFIG.CONFIG_PATH} with:")
+        print(configuration.text(), end="")
+    else:
+        if CONFIG.CONFIG_PATH.exists() and not args.force:
+            try:
+                existing = CONFIG.load_config()
+            except CONFIG.ConfigError as error:
+                raise SetupError(
+                    f"configuration already exists and is invalid; inspect it or use --force: {error}"
+                ) from error
+            if existing != configuration:
+                raise SetupError(
+                    f"configuration already exists at {CONFIG.CONFIG_PATH}; use --force to replace it"
+                )
+        _atomic_write(CONFIG.CONFIG_PATH, configuration.text(), 0o644)
+        print(f"wrote topology configuration: {CONFIG.CONFIG_PATH}")
+    _write_sudoers(account.pw_name, dry_run=args.dry_run)
+    if not args.dry_run:
+        print(f"wrote validated sudoers rule: {SUDOERS_PATH}")
+    _write_sunshine_dropin(unit, dry_run=args.dry_run)
+
+    if not args.dry_run:
+        result = subprocess.run(
+            [str(ROOT_HELPER), "probe"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode:
+            output = (result.stdout + result.stderr).strip()
+            raise SetupError(f"installed privileged helper probe failed: {output}")
+        print((result.stdout + result.stderr).strip())
+    _print_next_steps(configuration, unit)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("discover", help="list supported GPUs and connectors")
+    configure_parser = commands.add_parser(
+        "configure", help="write root-owned topology, sudoers, and service configuration"
+    )
+    default_user = os.environ.get("SUDO_USER") or ""
+    configure_parser.add_argument("--user", default=default_user, required=not bool(default_user))
+    configure_parser.add_argument("--pci-slot")
+    configure_parser.add_argument("--connector")
+    configure_parser.add_argument("--sunshine-unit")
+    configure_parser.add_argument("--force", action="store_true")
+    configure_parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = _parser().parse_args(argv)
+        if args.command == "discover":
+            _print_discovery(discover())
+        else:
+            configure(args)
+        return 0
+    except (CONFIG.ConfigError, SetupError, OSError, subprocess.SubprocessError) as error:
+        print(f"headless-virtual-display-setup: ERROR {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

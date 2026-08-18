@@ -1,7 +1,6 @@
 [Unit]
-Description=Normalize persistent DP-1 in the Plasma session
+Description=Normalize the persistent synthetic display in the Plasma session
 After=plasma-kwin_wayland.service
-Before=app-dev.lizardbyte.app.Sunshine.service
 PartOf=graphical-session.target
 
 [Service]

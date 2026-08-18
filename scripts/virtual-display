@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the persistent, synthetic DP-1 display for Sunshine."""
+"""Manage a configured persistent synthetic display for Sunshine."""
 
 from __future__ import annotations
 
@@ -24,14 +24,29 @@ from typing import Iterator
 
 sys.dont_write_bytecode = True
 
+VERSION = "0.2.0"
 
-CONNECTOR_NAME = "DP-1"
-EXPECTED_VENDOR = "0x1002"
-EXPECTED_DEVICE = "0x1586"
-EXPECTED_DRIVER = "amdgpu"
-EXPECTED_DESKTOP_USER = "owen"
-ROOT_HELPER = Path("/usr/local/libexec/headless-virtual-display-root")
-INSTALLED_EDID_MODULE = Path("/usr/local/lib/headless-virtual-display/edid.py")
+
+CONNECTOR_NAME = ""
+EXPECTED_VENDOR = ""
+EXPECTED_DEVICE = ""
+EXPECTED_DRIVER = ""
+EXPECTED_PCI_SLOT = ""
+EXPECTED_DESKTOP_USER = ""
+EXPECTED_DESKTOP_UID = -1
+
+
+def _installed_prefix() -> Path | None:
+    script_path = Path(__file__).resolve()
+    return script_path.parent.parent if script_path.parent.name == "bin" else None
+
+
+INSTALL_PREFIX = _installed_prefix()
+ROOT_HELPER = (
+    INSTALL_PREFIX / "libexec/headless-virtual-display-root"
+    if INSTALL_PREFIX is not None
+    else Path("/usr/local/libexec/headless-virtual-display-root")
+)
 KSCREEN_DOCTOR = Path("/usr/bin/kscreen-doctor")
 SUDO = Path("/usr/bin/sudo")
 POLL_INTERVAL_SECONDS = 0.2
@@ -48,25 +63,28 @@ class VirtualDisplayError(RuntimeError):
     """A safe, user-facing virtual-display failure."""
 
 
-def _load_edid_module() -> ModuleType:
+def _load_support_module(filename: str, module_name: str) -> ModuleType:
     script_path = Path(__file__).resolve()
-    if script_path.parent == Path("/usr/local/bin"):
-        module_path = INSTALLED_EDID_MODULE
+    development_path = script_path.parent / filename
+    if development_path.is_file():
+        module_path = development_path
+    elif INSTALL_PREFIX is not None:
+        module_path = INSTALL_PREFIX / "lib/headless-virtual-display" / filename
         try:
             metadata = module_path.stat()
         except OSError as error:
             raise VirtualDisplayError(
-                f"installed EDID module is unavailable at {module_path}: {error}"
+                f"installed support module is unavailable at {module_path}: {error}"
             ) from error
         if metadata.st_uid != 0 or metadata.st_mode & 0o022:
             raise VirtualDisplayError(
-                f"installed EDID module must be root-owned and not group/other-writable: {module_path}"
+                f"installed support module must be root-owned and not group/other-writable: {module_path}"
             )
     else:
-        module_path = script_path.parent / "edid.py"
+        raise VirtualDisplayError(f"cannot locate support module {filename}")
 
     spec = importlib.util.spec_from_file_location(
-        "headless_virtual_display_edid", module_path
+        module_name, module_path
     )
     if spec is None or spec.loader is None:
         raise VirtualDisplayError(f"cannot load EDID module from {module_path}")
@@ -76,7 +94,28 @@ def _load_edid_module() -> ModuleType:
     return module
 
 
-EDID = _load_edid_module()
+EDID = _load_support_module("edid.py", "headless_virtual_display_edid")
+CONFIG_SUPPORT = _load_support_module(
+    "config.py", "headless_virtual_display_config"
+)
+
+
+def _activate_config(configuration) -> None:
+    global CONNECTOR_NAME
+    global EXPECTED_VENDOR
+    global EXPECTED_DEVICE
+    global EXPECTED_DRIVER
+    global EXPECTED_PCI_SLOT
+    global EXPECTED_DESKTOP_USER
+    global EXPECTED_DESKTOP_UID
+
+    CONNECTOR_NAME = configuration.connector
+    EXPECTED_VENDOR = f"0x{configuration.pci_vendor}"
+    EXPECTED_DEVICE = f"0x{configuration.pci_device}"
+    EXPECTED_DRIVER = configuration.driver
+    EXPECTED_PCI_SLOT = configuration.pci_slot
+    EXPECTED_DESKTOP_USER = configuration.desktop_user
+    EXPECTED_DESKTOP_UID = configuration.desktop_uid
 
 
 @dataclass(frozen=True)
@@ -130,64 +169,60 @@ def _require_normal_user() -> None:
         raise VirtualDisplayError(
             f"cannot identify invoking UID {os.geteuid()}"
         ) from error
-    if user != EXPECTED_DESKTOP_USER:
+    if user != EXPECTED_DESKTOP_USER or os.geteuid() != EXPECTED_DESKTOP_UID:
         raise VirtualDisplayError(
-            f"run this helper as {EXPECTED_DESKTOP_USER}, not {user}"
+            f"run this helper as configured desktop user "
+            f"{EXPECTED_DESKTOP_USER} (UID {EXPECTED_DESKTOP_UID}), not "
+            f"{user} (UID {os.geteuid()})"
         )
 
 
 def _discover_topology() -> Topology:
-    matches: list[Topology] = []
-    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
-        if "-" in card.name:
-            continue
-        device_link = card / "device"
-        try:
-            vendor = (device_link / "vendor").read_text().strip().lower()
-            device = (device_link / "device").read_text().strip().lower()
-            driver = (device_link / "driver").resolve(strict=True).name
-            pci_device = device_link.resolve(strict=True)
-        except OSError:
-            continue
-        if (vendor, device, driver) != (
-            EXPECTED_VENDOR,
-            EXPECTED_DEVICE,
-            EXPECTED_DRIVER,
-        ):
-            continue
-        if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci_device.name):
-            raise VirtualDisplayError(
-                f"target GPU resolved to unexpected PCI identity {pci_device.name!r}"
-            )
-        connector = Path("/sys/class/drm") / f"{card.name}-{CONNECTOR_NAME}"
-        try:
-            connector_target = connector.resolve(strict=True)
-        except OSError as error:
-            raise VirtualDisplayError(
-                f"target GPU has no {CONNECTOR_NAME} connector: {error}"
-            ) from error
-        if not connector_target.is_relative_to(pci_device):
-            raise VirtualDisplayError(
-                f"{connector} resolves outside target PCI device: {connector_target}"
-            )
-        matches.append(
-            Topology(
-                card_name=card.name,
-                pci_slot=pci_device.name,
-                pci_device=pci_device,
-                connector=connector,
-            )
-        )
-    if not matches:
+    configured_device = Path("/sys/bus/pci/devices") / EXPECTED_PCI_SLOT
+    try:
+        pci_device = configured_device.resolve(strict=True)
+        vendor = (pci_device / "vendor").read_text().strip().lower()
+        device = (pci_device / "device").read_text().strip().lower()
+        driver = (pci_device / "driver").resolve(strict=True).name
+    except OSError as error:
         raise VirtualDisplayError(
-            "no unique AMD 1002:1586 amdgpu DRM device with DP-1 was found"
-        )
-    if len(matches) != 1:
-        slots = ", ".join(match.pci_slot for match in matches)
+            f"cannot inspect configured PCI device {EXPECTED_PCI_SLOT}: {error}"
+        ) from error
+    if pci_device.name != EXPECTED_PCI_SLOT or (vendor, device, driver) != (
+        EXPECTED_VENDOR,
+        EXPECTED_DEVICE,
+        EXPECTED_DRIVER,
+    ):
         raise VirtualDisplayError(
-            f"multiple AMD 1002:1586 amdgpu devices matched ({slots}); refusing ambiguity"
+            f"configured PCI binding mismatch: expected {EXPECTED_PCI_SLOT} "
+            f"{EXPECTED_VENDOR}:{EXPECTED_DEVICE} {EXPECTED_DRIVER}, found "
+            f"{pci_device.name} {vendor}:{device} {driver}"
         )
-    return matches[0]
+    cards = sorted(
+        path for path in (pci_device / "drm").glob("card[0-9]*") if "-" not in path.name
+    )
+    if len(cards) != 1:
+        raise VirtualDisplayError(
+            f"expected exactly one DRM card below {pci_device}, found {len(cards)}"
+        )
+    card = cards[0]
+    connector = Path("/sys/class/drm") / f"{card.name}-{CONNECTOR_NAME}"
+    try:
+        connector_target = connector.resolve(strict=True)
+    except OSError as error:
+        raise VirtualDisplayError(
+            f"configured GPU has no {CONNECTOR_NAME} connector: {error}"
+        ) from error
+    if not connector_target.is_relative_to(pci_device):
+        raise VirtualDisplayError(
+            f"{connector} resolves outside configured PCI device: {connector_target}"
+        )
+    return Topology(
+        card_name=card.name,
+        pci_slot=pci_device.name,
+        pci_device=pci_device,
+        connector=connector,
+    )
 
 
 def _connector_status(topology: Topology) -> str:
@@ -210,7 +245,7 @@ def _connector_edid(topology: Topology) -> bytes:
 
 def _managed_validation(data: bytes):
     try:
-        return EDID.validate_edid(data, require_poc_identity=True)
+        return EDID.validate_edid(data, require_managed_identity=True)
     except EDID.EdidError as error:
         raise VirtualDisplayError(
             f"{CONNECTOR_NAME} does not expose the managed VDS/0xd150 EDID: {error}"
@@ -374,14 +409,15 @@ def _set_kscreen(mode: KscreenMode, scale: float = 1.0) -> None:
         f"output.{CONNECTOR_NAME}.mode.{mode.mode_id}",
         f"output.{CONNECTOR_NAME}.scale.{scale:g}",
     ]
-    if any(not value.startswith("output.DP-1.") or "HDMI" in value for value in arguments):
+    expected_prefix = f"output.{CONNECTOR_NAME}."
+    if any(not value.startswith(expected_prefix) for value in arguments):
         raise VirtualDisplayError("internal KScreen output allowlist check failed")
     _run_kscreen(arguments)
 
 
 def _disable_kscreen() -> None:
     argument = f"output.{CONNECTOR_NAME}.disable"
-    if not argument.startswith("output.DP-1.") or "HDMI" in argument:
+    if not argument.startswith(f"output.{CONNECTOR_NAME}."):
         raise VirtualDisplayError("internal KScreen output allowlist check failed")
     _run_kscreen([argument])
 
@@ -403,7 +439,7 @@ def _secure_executable(path: Path, description: str) -> None:
 
 
 def _root_operation(operation: str, edid: bytes | None = None) -> None:
-    if operation not in {"apply", "retune", "remove"}:
+    if operation not in {"apply", "retune", "remove", "probe"}:
         raise VirtualDisplayError(f"internal privileged operation rejected: {operation}")
     _secure_executable(SUDO, "sudo")
     _secure_executable(ROOT_HELPER, "privileged virtual-display helper")
@@ -411,13 +447,13 @@ def _root_operation(operation: str, edid: bytes | None = None) -> None:
         if edid is None:
             raise VirtualDisplayError(f"{operation} requires an EDID")
         try:
-            EDID.validate_edid(edid, require_poc_identity=True)
+            EDID.validate_edid(edid, require_managed_identity=True)
         except EDID.EdidError as error:
             raise VirtualDisplayError(
                 f"refusing to send invalid managed EDID to root helper: {error}"
             ) from error
     elif edid is not None:
-        raise VirtualDisplayError("remove must not receive an EDID")
+        raise VirtualDisplayError(f"{operation} must not receive an EDID")
     try:
         result = subprocess.run(
             [str(SUDO), "-n", "--", str(ROOT_HELPER), operation],
@@ -551,7 +587,7 @@ def _validate_generated(normalized) -> None:
             normalized.width,
             normalized.height,
             normalized.refresh_hz,
-            require_poc_identity=True,
+            require_managed_identity=True,
         )
         external = EDID.validate_with_edid_decode(normalized.edid)
     except EDID.EdidError as error:
@@ -798,7 +834,7 @@ def _ensure_mode(
             except Exception as rollback_error:
                 raise VirtualDisplayError(
                     f"{label} failed: {error}; rollback also failed: {rollback_error}. "
-                    f"{CONNECTOR_NAME} needs manual recovery; HDMI-A-1 was never targeted."
+                    f"{CONNECTOR_NAME} needs manual recovery; no other connector was targeted."
                 ) from error
             raise VirtualDisplayError(
                 f"{label} failed and the previous display state was restored: {error}"
@@ -926,7 +962,9 @@ def command_remove(state_directory: Path) -> None:
     topology = _discover_topology()
     status = _connector_status(topology)
     if status == "unknown":
-        raise VirtualDisplayError("refusing remove while DP-1 status is unknown")
+        raise VirtualDisplayError(
+            f"refusing remove while {CONNECTOR_NAME} status is unknown"
+        )
     if status == "connected":
         _managed_validation(_connector_edid(topology))
     _root_operation("remove")
@@ -941,7 +979,7 @@ def command_remove(state_directory: Path) -> None:
         },
     )
     _log(f"{CONNECTOR_NAME} removed administratively")
-    _log("HDMI-A-1 was not targeted")
+    _log("no other connector was targeted")
 
 
 def command_status(state_directory: Path) -> None:
@@ -954,7 +992,9 @@ def command_status(state_directory: Path) -> None:
     profile = "absent"
     if exposed:
         try:
-            validation = EDID.validate_edid(exposed, require_poc_identity=True)
+            validation = EDID.validate_edid(
+                exposed, require_managed_identity=True
+            )
         except EDID.EdidError as error:
             identity = f"UNRECOGNIZED ({error})"
             profile = "unmanaged"
@@ -979,7 +1019,10 @@ def command_status(state_directory: Path) -> None:
         kwin_error = str(error)
     transient = _read_state(state_directory)
 
-    print(f"target: {CONNECTOR_NAME} ({topology.pci_slot}, {topology.card_name}, amdgpu)")
+    print(
+        f"target: {CONNECTOR_NAME} "
+        f"({topology.pci_slot}, {topology.card_name}, {EXPECTED_DRIVER})"
+    )
     print(f"DRM connector state: {status}")
     print(f"synthetic EDID identity: {identity}")
     print(f"active/generated mode: {generated_mode}")
@@ -1012,8 +1055,42 @@ def command_status(state_directory: Path) -> None:
             )
 
 
+def command_doctor() -> None:
+    topology = _discover_topology()
+    print(f"configuration: PASS ({CONFIG_SUPPORT.CONFIG_PATH})")
+    print(
+        f"desktop user: PASS ({EXPECTED_DESKTOP_USER}, UID {EXPECTED_DESKTOP_UID})"
+    )
+    print(
+        f"topology: PASS ({topology.pci_slot}, {topology.card_name}, "
+        f"{EXPECTED_DRIVER}, {CONNECTOR_NAME})"
+    )
+    _secure_executable(SUDO, "sudo")
+    _secure_executable(ROOT_HELPER, "privileged virtual-display helper")
+    if not KSCREEN_DOCTOR.is_file() or not os.access(KSCREEN_DOCTOR, os.X_OK):
+        raise VirtualDisplayError(f"kscreen-doctor is unavailable at {KSCREEN_DOCTOR}")
+    if not EDID.EDID_DECODE.is_file() or not os.access(EDID.EDID_DECODE, os.X_OK):
+        raise VirtualDisplayError(f"edid-decode is unavailable at {EDID.EDID_DECODE}")
+    print("runtime dependencies: PASS")
+    _root_operation("probe")
+    print("privileged topology/debugfs probe: PASS")
+    _desktop_environment()
+    state = _kscreen_state()
+    if state is None:
+        print(
+            f"KWin session: PASS ({CONNECTOR_NAME} is not currently exposed; "
+            "enable the baseline services next)"
+        )
+    else:
+        print(
+            f"KWin session: PASS ({CONNECTOR_NAME} connected={state.connected} "
+            f"enabled={state.enabled})"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("up", "retune"):
         mode = commands.add_parser(command)
@@ -1023,14 +1100,17 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("sunshine-up")
     commands.add_parser("baseline")
     commands.add_parser("status")
+    commands.add_parser("doctor")
     commands.add_parser("remove")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        _require_normal_user()
         args = _parser().parse_args(argv)
+        configuration = CONFIG_SUPPORT.load_config()
+        _activate_config(configuration)
+        _require_normal_user()
         with _operation_lock() as state_directory:
             if args.command in {"up", "retune"}:
                 command_mode(
@@ -1042,10 +1122,17 @@ def main(argv: list[str] | None = None) -> int:
                 command_baseline(state_directory)
             elif args.command == "remove":
                 command_remove(state_directory)
+            elif args.command == "doctor":
+                command_doctor()
             else:
                 command_status(state_directory)
         return 0
-    except (EDID.EdidError, VirtualDisplayError, OSError) as error:
+    except (
+        CONFIG_SUPPORT.ConfigError,
+        EDID.EdidError,
+        VirtualDisplayError,
+        OSError,
+    ) as error:
         _log(f"ERROR {error}", error=True)
         return 1
 

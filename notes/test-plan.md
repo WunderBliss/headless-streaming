@@ -1,242 +1,143 @@
-# Persistent virtual-display manual test plan
+# v0.2 manual release test plan
 
-Date: 2026-08-10 (Asia/Tokyo)
+Keep a physical recovery output attached through the first streaming test and
+keep SSH available. Never run `virtual-display` with sudo. Stop on an
+unrecognized EDID, unknown connector state, rollback failure, or an unexpected
+change to another output.
 
-## Safety gates
-
-- Keep physical HDMI-A-1 attached through Phases 1-3.
-- Keep SSH available.
-- Never prefix `/usr/local/bin/virtual-display` with sudo.
-- Do not change HDMI-A-1 mode, scale, position, priority, or enabled state.
-- Do not start a Moonlight stream until Phases 1 and 2 pass.
-- Record `virtual-display status` and relevant journals after any failure.
-- Stop on an unrecognized EDID, unknown connector status, rollback failure, or any
-  unexpected HDMI change.
-
-The installation/enable steps in `notes/install.md` must be complete first.
-
-## Phase 1: production helper sanity
-
-### 1. Baseline
+Record the configured connector from:
 
 ```bash
-/usr/local/bin/virtual-display baseline
-/usr/local/bin/virtual-display status
+connector="$(sed -n 's/^connector=//p' /etc/headless-virtual-display/topology.conf)"
+virtual-display doctor
+virtual-display status
 ```
 
-Require:
+## Phase 1: clean installation and configuration
 
-- DRM DP-1 connected;
-- full managed VDS identity valid;
-- active/generated mode approximately `1920x1080@59.96`;
-- KWin DP-1 connected and enabled at 1920x1080, scale 1;
-- display profile `baseline`; and
-- HDMI-A-1 unchanged in `kscreen-doctor -o`.
+1. Build and test from a clean checkout:
 
-### 2. Exact high-refresh retune
+   ```bash
+   make check
+   ```
+
+2. Exercise a staged package layout:
+
+   ```bash
+   package_root="$(mktemp -d)"
+   make PREFIX=/usr BUILD_DIR=build-package check
+   make PREFIX=/usr BUILD_DIR=build-package DESTDIR="$package_root" install
+   test -x "$package_root/usr/bin/virtual-display"
+   test ! -e "$package_root/etc/sudoers.d/headless-virtual-display"
+   ```
+
+3. Install and run setup first with `--dry-run`, then for real. Require explicit
+   connector selection, a root-owned configuration, a `visudo`-valid exact-user
+   rule, and a successful root-helper probe.
+
+4. Verify setup's final output mentions optional display-manager autologin and
+   KWallet password changes, clearly states both reduce security, and confirms
+   neither was changed automatically.
+
+## Phase 2: baseline and exact modes
+
+Enable both services as documented, then require:
 
 ```bash
-/usr/local/bin/virtual-display retune 2560 1600 120
-/usr/local/bin/virtual-display status
+virtual-display baseline
+virtual-display status
 ```
 
-Require log lines showing requested/effective exact
-`2560x1600@120`, retune success, KWin approximately 119.96 Hz, scale 1, and
-profile `retuned`.
+- configured connector connected with the full managed identity;
+- generated mode approximately `1920x1080@59.96`;
+- KWin output connected and enabled at scale 1;
+- every non-configured output unchanged.
 
-### 3. Exact smaller retune
+Test exact transitions:
 
 ```bash
-/usr/local/bin/virtual-display retune 1280 800 90
-/usr/local/bin/virtual-display status
+virtual-display retune 2560 1600 120
+virtual-display status
+virtual-display retune 1280 800 90
+virtual-display status
 ```
 
-Require exact `1280x800@90`, KWin approximately 89.89 Hz, scale 1, and managed
-identity. Confirm HDMI-A-1 did not flicker or change.
+Require exact modes near 119.96 and 89.89 Hz respectively, scale 1, managed
+identity, and no change to another output.
 
-## Phase 2: fallback and no-partial-state tests
-
-Record a starting snapshot:
+## Phase 3: fallback and no-partial-state behavior
 
 ```bash
-before_edid="$(sha256sum /sys/class/drm/card1-DP-1/edid | awk '{print $1}')"
-/usr/local/bin/virtual-display status
+virtual-display retune 3840 2160 90
+virtual-display status
 ```
 
-The read-only `card1` path is shown here only for the known current host. The
-helper itself discovers the card dynamically.
-
-### 1. Unsupported 4K refresh
+Require explicit exact-mode rejection and effective `3840x2160@60`.
 
 ```bash
-/usr/local/bin/virtual-display retune 3840 2160 90
-/usr/local/bin/virtual-display status
+virtual-display retune 5120 2880 60
+virtual-display status
 ```
 
-Require concise logs equivalent to:
+Require width-limit rejection and aspect-exact `3840x2160@60` fallback.
 
-```text
-virtual-display: requested 3840x2160@90
-virtual-display: exact mode unsupported: ...
-virtual-display: using fallback 3840x2160@60
-```
-
-Status must show managed 3840x2160 at approximately 60 Hz and scale 1.
-
-### 2. Over-width 5K request
+Use the card and connector reported by `virtual-display status` to hash the
+current EDID. Submit malformed Sunshine and CLI inputs, then prove the hash did
+not change:
 
 ```bash
-/usr/local/bin/virtual-display retune 5120 2880 60
-/usr/local/bin/virtual-display status
-```
-
-Require exact rejection because width exceeds 4095 and effective
-`3840x2160@60`, with no aspect warning/error.
-
-Optional additional aspect check:
-
-```bash
-/usr/local/bin/virtual-display retune 6016 3384 60
-/usr/local/bin/virtual-display status
-```
-
-Expected effective mode is also aspect-exact `3840x2160@60`.
-
-### 3. Invalid input must not mutate DRM
-
-Capture the current EDID hash, issue malformed requests, and compare:
-
-```bash
-safe_edid="$(sha256sum /sys/class/drm/card1-DP-1/edid | awk '{print $1}')"
 env SUNSHINE_CLIENT_WIDTH='3840x2160' \
     SUNSHINE_CLIENT_HEIGHT=2160 \
     SUNSHINE_CLIENT_FPS=60 \
-    /usr/local/bin/virtual-display sunshine-up
-test "$safe_edid" = "$(sha256sum /sys/class/drm/card1-DP-1/edid | awk '{print $1}')"
+    virtual-display sunshine-up
 
-/usr/local/bin/virtual-display retune 0 2160 60
-test "$safe_edid" = "$(sha256sum /sys/class/drm/card1-DP-1/edid | awk '{print $1}')"
+virtual-display retune 0 2160 60
 ```
 
-Both helper calls must exit nonzero before sudo. The hashes must match, DP-1 must
-remain connected/managed/active, and HDMI-A-1 must remain unchanged.
+Both commands must fail before a privileged mutation. Restore baseline.
 
-Restore baseline before Sunshine testing:
+## Phase 4: Sunshine with recovery display attached
 
-```bash
-/usr/local/bin/virtual-display baseline
-/usr/local/bin/virtual-display status
-```
+1. Confirm the live Sunshine configuration names the configured connector and
+   uses the installed `virtual-display sunshine-up` prep command with empty undo.
+2. Confirm its application does not exclude global prep commands.
+3. Restart the configured Sunshine user unit and note the journal time.
+4. Launch a Moonlight client at a known native resolution/FPS.
+5. Require:
 
-## Phase 3: first real Sunshine/Moonlight test with HDMI attached
+   - prep logs requested and effective modes;
+   - DRM and KWin verification succeeds;
+   - video, audio, and applicable input work;
+   - the stream shows the configured virtual desktop;
+   - Sunshine logs `[kwingrab] Screencasting output name CONFIGURED_CONNECTOR`.
 
-### 1. Establish and record the safe start
+Disconnect and resume, then quit the application. The virtual connector must
+remain at its last successful mode. Restore baseline manually.
 
-```bash
-/usr/local/bin/virtual-display baseline
-/usr/local/bin/virtual-display status
-kscreen-doctor -o
-```
+## Phase 5: migration
 
-Confirm DP-1 baseline and HDMI-A-1 recovery output are both present. Confirm the
-live Sunshine settings are `kwin`, `vaapi`, `DP-1`, with the fixed global prep do
-command and empty undo. Confirm the selected application does not exclude global
-prep commands.
+On an initial-release installation with the legacy managed EDID active:
 
-### 2. Restart Sunshine manually and mark the journal time
+1. install v0.2 without first removing the connector;
+2. configure the same user, PCI device, and connector;
+3. require setup/probe to accept the complete legacy identity;
+4. run `baseline` and require the new `HEADLESS-VDS` identity;
+5. repeat one real stream and rollback test.
 
-```bash
-test_started="$(date --iso-8601=seconds)"
-systemctl --user restart app-dev.lizardbyte.app.Sunshine.service
-systemctl --user status app-dev.lizardbyte.app.Sunshine.service --no-pager
-journalctl --user -u app-dev.lizardbyte.app.Sunshine.service \
-  --since "$test_started" --no-pager
-```
+An unknown connected EDID must remain rejected.
 
-Sunshine's startup probe must see DP-1. Do not proceed if the baseline unit or
-Sunshine failed.
+## Phase 6: cold boot, suspend, and uninstall
 
-### 3. Connect the actual Moonlight client
+Only after earlier phases pass:
 
-From Moonlight, launch the intended application/Desktop and request a known
-client-native resolution and FPS. Do this manually; there is no automated stream
-start in the project.
+1. Confirm SSH recovery.
+2. Cold boot with every physical display disconnected.
+3. Require root baseline before the display manager, configured Plasma session,
+   KWin baseline before Sunshine, and a successful stream.
+4. Suspend/resume and repeat status plus streaming verification.
+5. Follow the uninstall sequence, removing the managed connector before helper
+   and sudoers removal.
+6. Reinstall from the package and repeat `doctor` plus baseline.
 
-Immediately inspect:
-
-```bash
-/usr/local/bin/virtual-display status
-journalctl --user -u app-dev.lizardbyte.app.Sunshine.service \
-  --since "$test_started" --no-pager | \
-  rg 'virtual-display:|\[kwingrab\]|Encoder|Capture|error|warning'
-```
-
-Require all of the following:
-
-- prep logged the exact client request;
-- it logged exact or a documented fallback and the effective mode;
-- DP-1 was retuned successfully;
-- KWin DP-1 is enabled/current at the effective mode and scale 1;
-- the stream shows video from the DP-1 desktop;
-- audio works;
-- keyboard/mouse/controller input works as applicable; and
-- the journal contains exactly this targeting evidence:
-
-  ```text
-  [kwingrab] Screencasting output name DP-1
-  ```
-
-If that line is absent, targeting is not proven even if video appears correct.
-Stop the test and inspect full logs. If the line names HDMI-A-1, stop immediately;
-do not treat the session as a pass.
-
-### 4. Persistence across disconnect/resume and quit
-
-Disconnect the Moonlight client without quitting the Sunshine application.
-Then run:
-
-```bash
-/usr/local/bin/virtual-display status
-```
-
-DP-1 must remain connected at the last effective mode. Reconnect/resume and
-reconfirm the `[kwingrab] ... DP-1` line for the new capture start if one is
-logged. Then use Moonlight's Quit Session and check status again. DP-1 must still
-exist; no undo removes it.
-
-Finally restore the conservative idle state manually:
-
-```bash
-/usr/local/bin/virtual-display baseline
-```
-
-## Phase 4: later cold boot without HDMI
-
-Do not perform this phase until Phases 1-3 pass and SSH recovery has been tested.
-
-1. Restore baseline and cleanly shut down through the normal OS workflow.
-2. Disconnect HDMI-A-1 while powered off.
-3. Cold boot; do not change kernel arguments.
-4. Connect over SSH and check:
-
-   ```bash
-   systemctl status headless-virtual-display-drm.service --no-pager
-   systemctl --user status headless-virtual-display-kwin.service --no-pager
-   systemctl --user status app-dev.lizardbyte.app.Sunshine.service --no-pager
-   /usr/local/bin/virtual-display status
-   ```
-
-5. Require DP-1 baseline before Sunshine, Plasma/KWin active DP-1 scale 1, and a
-   running Sunshine service.
-6. Connect Moonlight, request a dynamic mode, and repeat all Phase 3 targeting,
-   video/audio/input, disconnect/resume, and persistence checks.
-7. Keep SSH as the recovery path. Use `virtual-display baseline` first; use
-   `virtual-display remove` only for explicit administrative recovery.
-
-## Results to record
-
-For every phase, record requested/effective modes, EDID identity, actual KWin
-refresh/scale, helper exit status, relevant journal excerpts, any visible blanking,
-whether DP-1 ever sampled disconnected, and any HDMI-A-1 change. Record the exact
-Sunshine package version when Phase 3 is run because its output fallback behavior
-is version-sensitive.
+Record kernel, Mesa, Plasma, KScreen, Sunshine, GPU, requested/effective modes,
+codec, visible blanking, rollback results, and journals for every release test.

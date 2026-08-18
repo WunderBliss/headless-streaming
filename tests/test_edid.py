@@ -21,7 +21,7 @@ class NormalizationTests(unittest.TestCase):
             normalized.width,
             normalized.height,
             normalized.refresh_hz,
-            require_poc_identity=True,
+            require_managed_identity=True,
         )
 
     def test_known_exact_modes_remain_exact(self) -> None:
@@ -96,6 +96,14 @@ class NormalizationTests(unittest.TestCase):
             EDID.BASELINE_MODE,
         )
         self.assert_valid(normalized)
+
+    def test_legacy_managed_identity_remains_accepted_for_upgrade(self) -> None:
+        legacy = (
+            Path(__file__).resolve().parents[1]
+            / "test-data/generated-1920x1080-75.edid"
+        ).read_bytes()
+        result = EDID.validate_edid(legacy, require_managed_identity=True)
+        self.assertEqual((result.manufacturer, result.product_code), ("VDS", 0xD150))
 
 
 if __name__ == "__main__":

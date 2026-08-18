@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install runtime and check dependencies
+        run: pacman -Syu --noconfirm git kwin libkscreen python sudo systemd v4l-utils ripgrep
+
+      - uses: actions/checkout@v4
+
+      - name: Mark checkout safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build and test
+        run: make check
+
+      - name: Exercise packaged /usr layout
+        run: |
+          package_root="$(mktemp -d)"
+          make PREFIX=/usr BUILD_DIR=build-package check
+          make PREFIX=/usr BUILD_DIR=build-package \
+            SYSTEMD_SYSTEM_DIR=/usr/lib/systemd/system \
+            SYSTEMD_USER_DIR=/usr/lib/systemd/user \
+            DESTDIR="$package_root" install
+          test -x "$package_root/usr/bin/virtual-display"
+          test -x "$package_root/usr/bin/headless-virtual-display-setup"
+          test -x "$package_root/usr/libexec/headless-virtual-display-root"
+          test -f "$package_root/usr/lib/headless-virtual-display/config.py"
+          test ! -e "$package_root/etc/sudoers.d/headless-virtual-display"

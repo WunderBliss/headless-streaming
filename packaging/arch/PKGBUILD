@@ -1,0 +1,40 @@
+# Maintainer: Owen Orsetti
+pkgname=headless-virtual-display-git
+pkgver=0.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="Persistent client-sized virtual display for Sunshine on AMDGPU and KDE Wayland"
+arch=('x86_64')
+url="https://github.com/WunderBliss/headless-streaming"
+license=('MIT')
+depends=('kwin' 'libkscreen' 'python' 'sudo' 'systemd' 'v4l-utils')
+makedepends=('git')
+optdepends=('sunshine: Moonlight-compatible streaming server')
+provides=('headless-virtual-display')
+conflicts=('headless-virtual-display')
+install=headless-virtual-display.install
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd headless-streaming
+  printf '0.2.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd headless-streaming
+  make PREFIX=/usr
+}
+
+check() {
+  cd headless-streaming
+  make PREFIX=/usr check
+}
+
+package() {
+  cd headless-streaming
+  make PREFIX=/usr \
+    SYSTEMD_SYSTEM_DIR=/usr/lib/systemd/system \
+    SYSTEMD_USER_DIR=/usr/lib/systemd/user \
+    DESTDIR="$pkgdir" install
+  install -D -m 0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

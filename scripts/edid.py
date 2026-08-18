@@ -14,6 +14,10 @@ from pathlib import Path
 EDID_HEADER = bytes.fromhex("00 ff ff ff ff ff ff 00")
 MANUFACTURER = "VDS"
 PRODUCT_CODE = 0xD150
+MONITOR_NAME = "HEADLESS-VDS"
+SERIAL_TEXT = "HVD-00000001"
+LEGACY_MONITOR_NAME = "VIRTUAL-POC"
+LEGACY_SERIAL_TEXT = "VDS-POC-0001"
 EDID_VERSION = (1, 4)
 REFRESH_TOLERANCE_HZ = 0.5
 FALLBACK_MAX_WIDTH = 3840
@@ -404,14 +408,14 @@ def generate_edid(width: int, height: int, refresh_hz: float) -> bytes:
     edid[35:38] = bytes(3)  # No legacy established timings.
     edid[38:54] = b"\x01\x01" * 8  # No standard timings.
     edid[54:72] = _pack_dtd(timing, width_mm, height_mm)
-    edid[72:90] = _text_descriptor(0xFC, "VIRTUAL-POC")
-    edid[90:108] = _text_descriptor(0xFF, "VDS-POC-0001")
+    edid[72:90] = _text_descriptor(0xFC, MONITOR_NAME)
+    edid[90:108] = _text_descriptor(0xFF, SERIAL_TEXT)
     edid[108:126] = bytes((0, 0, 0, 0x10, 0)) + bytes(13)  # Dummy descriptor.
     edid[126] = 0  # No extension blocks.
     edid[127] = (-sum(edid[:127])) & 0xFF
 
     result = bytes(edid)
-    validate_edid(result, width, height, refresh_hz, require_poc_identity=True)
+    validate_edid(result, width, height, refresh_hz, require_managed_identity=True)
     return result
 
 
@@ -649,6 +653,7 @@ def validate_edid(
     expected_height: int | None = None,
     expected_hz: float | None = None,
     *,
+    require_managed_identity: bool = False,
     require_poc_identity: bool = False,
 ) -> ValidationResult:
     if len(data) < 128 or len(data) % 128:
@@ -673,17 +678,23 @@ def validate_edid(
 
     manufacturer = _decode_manufacturer(data[8:10])
     product_code = int.from_bytes(data[10:12], "little")
-    if require_poc_identity:
-        identity_matches = (
+    if require_managed_identity or require_poc_identity:
+        common_identity = (
             (manufacturer, product_code) == (MANUFACTURER, PRODUCT_CODE)
             and data[12:16] == bytes(4)
-            and data[72:90] == _text_descriptor(0xFC, "VIRTUAL-POC")
-            and data[90:108] == _text_descriptor(0xFF, "VDS-POC-0001")
             and data[108:126] == bytes((0, 0, 0, 0x10, 0)) + bytes(13)
             and data[126] == 0
         )
-        if not identity_matches:
-            raise EdidError("EDID is not owned by this virtual-display POC")
+        current_identity = (
+            data[72:90] == _text_descriptor(0xFC, MONITOR_NAME)
+            and data[90:108] == _text_descriptor(0xFF, SERIAL_TEXT)
+        )
+        legacy_identity = (
+            data[72:90] == _text_descriptor(0xFC, LEGACY_MONITOR_NAME)
+            and data[90:108] == _text_descriptor(0xFF, LEGACY_SERIAL_TEXT)
+        )
+        if not common_identity or not (current_identity or legacy_identity):
+            raise EdidError("EDID is not owned by headless-virtual-display")
 
     requested = expected_hz if expected_hz is not None else 0.0
     timing, width_mm, height_mm = _parse_dtd(data[54:72], requested)
@@ -712,12 +723,15 @@ def validate_edid(
     )
 
 
-def is_poc_edid(data: bytes) -> bool:
+def is_managed_edid(data: bytes) -> bool:
     try:
-        validate_edid(data, require_poc_identity=True)
+        validate_edid(data, require_managed_identity=True)
     except EdidError:
         return False
     return True
+
+
+is_poc_edid = is_managed_edid
 
 
 def validate_with_edid_decode(data: bytes) -> str | None:
@@ -770,7 +784,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "generate":
             data = generate_edid(args.width, args.height, args.fps)
             result = validate_edid(
-                data, args.width, args.height, args.fps, require_poc_identity=True
+                data,
+                args.width,
+                args.height,
+                args.fps,
+                require_managed_identity=True,
             )
             external_output = validate_with_edid_decode(data)
             output = args.output.resolve(strict=False)
@@ -819,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
                 normalized.width,
                 normalized.height,
                 normalized.refresh_hz,
-                require_poc_identity=True,
+                require_managed_identity=True,
             )
             external_output = validate_with_edid_decode(normalized.edid)
         print("\n".join(result.lines()))
